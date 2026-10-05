@@ -43,6 +43,7 @@ from qiskit.transpiler.passes import Collect1qRuns
 from qiskit.transpiler.passes import Collect2qBlocks
 from qiskit.transpiler.passes import GateDirection
 from qiskit.transpiler.preset_passmanagers import common
+from qiskit.transpiler.preset_passmanagers._swap_absorption import _AbsorbIntoSwaps
 from qiskit.transpiler.preset_passmanagers.plugin import (
     PassManagerStagePlugin,
     PassManagerStagePluginManager,
@@ -203,7 +204,21 @@ class DefaultTranslationPassManager(PassManagerStagePlugin):
         # start transitioning the default method without breaking the semantics of the default
         # string referring to the `BasisTranslator`.
 
-        return BasisTranslatorPassManager().pass_manager(pass_manager_config, optimization_level)
+        translation = BasisTranslatorPassManager().pass_manager(
+            pass_manager_config, optimization_level
+        )
+        if optimization_level in (2, 3):
+            # On an angle-bounded target, merged controlled-phase blocks make the level 3 loop
+            # re-run the translation stage for many more iterations.
+            target = pass_manager_config.target
+            absorb_controlled_phase = (
+                optimization_level == 2 or target is None or not target.has_angle_bounds()
+            )
+            translation = (
+                PassManager([_AbsorbIntoSwaps(absorb_controlled_phase=absorb_controlled_phase)])
+                + translation
+            )
+        return translation
 
 
 class BasisTranslatorPassManager(PassManagerStagePlugin):
