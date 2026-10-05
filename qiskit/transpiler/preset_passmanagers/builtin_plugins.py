@@ -35,6 +35,7 @@ from qiskit.transpiler.passes import ElidePermutations
 from qiskit.transpiler.passes import RemoveDiagonalGatesBeforeMeasure
 from qiskit.transpiler.passes import CommutativeOptimization
 from qiskit.transpiler.passes import TwoQubitPeepholeOptimization
+from qiskit.transpiler.passes import WrapAngles
 from qiskit.transpiler.passes import BasisTranslator
 from qiskit.transpiler.passes import SynthesizeRZRotations
 from qiskit.transpiler.passes import OptimizeCliffordT
@@ -208,16 +209,10 @@ class DefaultTranslationPassManager(PassManagerStagePlugin):
             pass_manager_config, optimization_level
         )
         if optimization_level in (2, 3):
-            # On an angle-bounded target, merged controlled-phase blocks make the level 3 loop
-            # re-run the translation stage for many more iterations.
-            target = pass_manager_config.target
-            absorb_controlled_phase = (
-                optimization_level == 2 or target is None or not target.has_angle_bounds()
-            )
-            translation = (
-                PassManager([_AbsorbIntoSwaps(absorb_controlled_phase=absorb_controlled_phase)])
-                + translation
-            )
+            # Only the level 3 loop re-runs the peephole on the blocks around a merged swap, so
+            # only there can a short-T2 qubit be left with trailing single-qubit gates.
+            target = pass_manager_config.target if optimization_level == 3 else None
+            translation = PassManager([_AbsorbIntoSwaps(target=target)]) + translation
         return translation
 
 
@@ -598,6 +593,16 @@ class OptimizationPassManager(PassManagerStagePlugin):
                         pass_manager_config.target,
                         approximation_degree=pass_manager_config.approximation_degree,
                     ),
+                ]
+                if (
+                    pass_manager_config.target is not None
+                    and pass_manager_config.target.has_angle_bounds()
+                ):
+                    # The peephole can synthesize angles outside the target's bounds.  Without
+                    # wrapping them here, the basis check below fails in every iteration and the
+                    # loop does not reach a fixed point.
+                    loop.append(WrapAngles(pass_manager_config.target))
+                loop += [
                     RemoveIdentityEquivalent(
                         approximation_degree=pass_manager_config.approximation_degree,
                         target=pass_manager_config.target,

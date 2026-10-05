@@ -20,20 +20,22 @@ from ddt import ddt, data
 
 from qiskit.circuit import Gate, Parameter, QuantumCircuit, QuantumRegister
 from qiskit.circuit.library import CU1Gate, RZGate, RZZGate, U1Gate, UnitaryGate, XGate
-from qiskit.circuit.library import qaoa_ansatz
+from qiskit.circuit.library import QFTGate, qaoa_ansatz
 from qiskit.converters import circuit_to_dag, dag_to_circuit
 from qiskit.dagcircuit import DAGCircuit
+from qiskit.passmanager.flow_controllers import DoWhileController
+from qiskit.providers import QubitProperties
 from qiskit.quantum_info import Operator, SparsePauliOp
 from qiskit.transpiler import CouplingMap, PassManager, Target, generate_preset_pass_manager
-from qiskit.transpiler.passes import WrapAngles
+from qiskit.transpiler.passes import TwoQubitPeepholeOptimization, WrapAngles
 from qiskit.transpiler.passes.utils.wrap_angles import WrapAngleRegistry
 from qiskit.transpiler.preset_passmanagers import builtin_plugins
 from qiskit.transpiler.preset_passmanagers import _swap_absorption
 from qiskit.transpiler.preset_passmanagers._swap_absorption import (
     _AbsorbIntoSwaps,
-    _CONTROLLED_PHASE_GATES,
     _WIRE_PAULIS,
     _find_moves,
+    _short_t2_qubits,
 )
 from test import QiskitTestCase
 
@@ -110,8 +112,13 @@ def _phase_and_cx_circuit(num_qubits=5):
     return qc
 
 
-def _compile_recording_moves(level, target, circuit, seed=7):
-    """Compile with the preset pass manager; return the output and the names of moved units."""
+def _compile_recording_moves(level, target, circuit, seed=7, wrap_in_loop=True):
+    """Compile with the preset pass manager.
+
+    Return the output, the names of the moved units and the number of level 3 loop iterations
+    (runs of the in-loop two-qubit peephole).  ``wrap_in_loop=False`` removes ``WrapAngles``
+    from the level 3 loop.
+    """
     moved = []
     original = _swap_absorption._find_moves
 
@@ -120,18 +127,39 @@ def _compile_recording_moves(level, target, circuit, seed=7):
         moved.extend(order[units[unit][0][0]].name for unit, _, _ in moves)
         return order, units, moves
 
+    peepholes = []
+
+    def callback(pass_, **_):
+        if isinstance(pass_, TwoQubitPeepholeOptimization):
+            peepholes.append(pass_)
+
     registry = WrapAngleRegistry()
     registry.add_wrapper("rzz", _fold_rzz)
     with (
         patch.object(_swap_absorption, "_find_moves", recording),
         patch.object(WrapAngles, "DEFAULT_REGISTRY", registry),
     ):
-        out = generate_preset_pass_manager(level, target=target, seed_transpiler=seed).run(circuit)
-    return out, moved
+        pm = generate_preset_pass_manager(level, target=target, seed_transpiler=seed)
+        if not wrap_in_loop:
+            for controller in pm.optimization._tasks:
+                for task in controller:
+                    if isinstance(task, DoWhileController):
+                        task.tasks = [t for t in task.tasks if not isinstance(t, WrapAngles)]
+        out = pm.run(circuit, callback=callback)
+    return out, moved, len(peepholes) - (level == 2)
 
 
-def _translation_stage_with_default_pass(self, pass_manager_config, optimization_level=None):
-    """The default translation stage with the level 2 pass in its default configuration."""
+def _rzz_in_bounds(circuit):
+    """Whether every ``rzz`` angle of ``circuit`` lies in ``[0, pi/2]``."""
+    return all(
+        0 <= float(inst.operation.params[0]) <= math.pi / 2 + 1e-12
+        for inst in circuit.data
+        if inst.operation.name == "rzz"
+    )
+
+
+def _translation_stage_without_target(self, pass_manager_config, optimization_level=None):
+    """The default translation stage with the level 2 pass built without a target."""
     translation = builtin_plugins.BasisTranslatorPassManager().pass_manager(
         pass_manager_config, optimization_level
     )
@@ -140,96 +168,123 @@ def _translation_stage_with_default_pass(self, pass_manager_config, optimization
     return translation
 
 
+def _tail_circuit(measure=False, other_pair=False, final_barrier=False):
+    """A SWAP on (0, 1) whose ``cp`` moves next to it; then qubit 1 only works with qubit 2."""
+    qc = QuantumCircuit(4, 1)
+    qc.h(0)
+    qc.swap(0, 1)
+    qc.rz(0.2, 0)
+    qc.cz(0, 2)
+    qc.cp(0.3, 0, 1)
+    qc.cx(0, 2)
+    qc.cx(0, 3)
+    qc.cx(1, 2)
+    if other_pair:
+        qc.cx(1, 3)
+    if final_barrier:
+        qc.barrier()
+    if measure:
+        qc.measure(1, 0)
+    return qc
+
+
+def _t2_target(num_qubits, t2):
+    """A CZ line Target whose qubits have the T2 times ``t2`` (seconds, ``None`` for unknown)."""
+    target = Target.from_configuration(
+        ["cz", "rz", "sx", "x"],
+        num_qubits=num_qubits,
+        coupling_map=CouplingMap.from_line(num_qubits),
+    )
+    target.qubit_properties = [QubitProperties(t1=1e-4, t2=value) for value in t2]
+    return target
+
+
 @ddt
 class TestAbsorbIntoSwaps(QiskitTestCase):
     """Test the ``_AbsorbIntoSwaps`` pass."""
 
     @data(
-        (0, False, None),
-        (1, False, None),
+        (0, False, False),
+        (1, False, False),
         (2, False, True),
         (2, True, True),
         (3, False, True),
-        (3, True, False),
+        (3, True, True),
     )
     def test_preset_absorption_levels(self, setting):
-        """O2 and O3 include the pass; O3 keeps controlled phases only on angle-bounded Targets."""
-        level, angle_bounded, absorb_controlled_phase = setting
+        """O2 and O3 include the pass, whether or not the Target has angle bounds."""
+        level, angle_bounded, enabled = setting
         target = _line_target(4, angle_bounded)
         self.assertEqual(target.has_angle_bounds(), angle_bounded)
         pm = generate_preset_pass_manager(level, target=target)
         first = pm.translation._tasks[0][0]
-        self.assertEqual(isinstance(first, _AbsorbIntoSwaps), absorb_controlled_phase is not None)
-        if absorb_controlled_phase is not None:
-            self.assertEqual(first.absorb_controlled_phase, absorb_controlled_phase)
+        self.assertEqual(isinstance(first, _AbsorbIntoSwaps), enabled)
+        if enabled:
+            # Only level 3 gives the pass the target, for the tail rule.
+            self.assertIs(first.target, target if level == 3 else None)
 
     def test_preset_absorption_without_target(self):
-        """Basis gates alone (no angle bounds) absorb controlled phases at O2 and O3."""
+        """Basis gates alone also get the pass at O2 and O3."""
         for level in (2, 3):
             pm = generate_preset_pass_manager(level, basis_gates=["cx", "rz", "sx", "x"])
-            self.assertTrue(pm.translation._tasks[0][0].absorb_controlled_phase)
+            self.assertIsInstance(pm.translation._tasks[0][0], _AbsorbIntoSwaps)
 
-    def test_controlled_phase_option(self):
-        """The option only stops controlled-phase units; it is on by default."""
-        self.assertTrue(_AbsorbIntoSwaps().absorb_controlled_phase)
-        qc = QuantumCircuit(3)
-        qc.h(0)
-        qc.swap(0, 1)
-        qc.rz(0.2, 0)
-        qc.cz(0, 2)
-        qc.cp(0.3, 0, 1)
-        qc.cx(0, 2)
-        qc.cx(1, 2)
-        for name in sorted(_CONTROLLED_PHASE_GATES):
-            phase = qc.copy_empty_like()
-            for instruction in qc.data:
-                if instruction.name == "cp":
-                    _append_standard(phase, name, instruction.qubits)
-                else:
-                    phase.append(instruction)
-            dag = circuit_to_dag(phase)
-            self.assertEqual(len(_find_moves(dag)[2]), 1)
-            self.assertEqual(len(_find_moves(dag, absorb_controlled_phase=False)[2]), 0)
-            off = dag_to_circuit(_AbsorbIntoSwaps(absorb_controlled_phase=False).run(dag))
-            self.assertEqual(off, phase)
-        # A non-phase unit still moves with the option off.
-        cz = QuantumCircuit(3)
-        cz.h(0)
-        cz.swap(0, 1)
-        cz.rz(0.2, 0)
-        cz.cz(0, 2)
-        cz.cz(0, 1)
-        cz.cx(0, 2)
-        cz.cx(1, 2)
-        self.assertEqual(len(_find_moves(circuit_to_dag(cz), absorb_controlled_phase=False)[2]), 1)
+    @data((2, False), (2, True), (3, False), (3, True))
+    def test_wrap_angles_in_level_three_loop(self, setting):
+        """Only the O3 loop on an angle-bounded Target runs ``WrapAngles`` after the peephole."""
+        level, angle_bounded = setting
+        pm = generate_preset_pass_manager(level, target=_line_target(4, angle_bounded))
+        loops = [
+            task.tasks
+            for controller in pm.optimization._tasks
+            for task in controller
+            if isinstance(task, DoWhileController)
+        ]
+        self.assertEqual(len(loops), 1)
+        names = [type(task).__name__ for task in loops[0]]
+        if level == 3 and angle_bounded:
+            self.assertEqual(names[:2], ["TwoQubitPeepholeOptimization", "WrapAngles"])
+        else:
+            self.assertNotIn("WrapAngles", names)
 
-    def test_level_three_angle_bounded_moves_no_controlled_phase(self):
-        """O3 on an angle-bounded Target never moves a controlled phase, but O2 there does."""
+    def test_level_three_angle_bounded_moves_controlled_phase(self):
+        """O3 on an angle-bounded Target moves controlled phases, exactly and within bounds."""
         target = _line_target(5, angle_bounded=True)
         qc = _phase_and_cx_circuit()
         for seed in (3, 7, 11):
-            out, moved = _compile_recording_moves(3, target, qc, seed)
-            self.assertFalse(set(moved) & _CONTROLLED_PHASE_GATES, moved)
+            out, moved, _ = _compile_recording_moves(3, target, qc, seed)
+            self.assertTrue(set(moved) & {"cp", "cu1", "cs", "csdg"}, moved)
             self.assertTrue(Operator.from_circuit(out).equiv(Operator(qc)))
-            _, moved_o2 = _compile_recording_moves(2, target, qc, seed)
-            self.assertTrue(set(moved_o2) & _CONTROLLED_PHASE_GATES, moved_o2)
+            self.assertTrue(_rzz_in_bounds(out))
+
+    def test_level_three_angle_bounded_loop_converges(self):
+        """With ``WrapAngles`` in the O3 loop, the loop needs fewer iterations than without."""
+        target = _line_target(6, angle_bounded=True)
+        qc = QuantumCircuit(6)
+        qc.append(QFTGate(6), range(6))
+        qc = qc.decompose()
+        for seed in (3, 7):
+            out, _, iterations = _compile_recording_moves(3, target, qc, seed)
+            old, _, old_iterations = _compile_recording_moves(
+                3, target, qc, seed, wrap_in_loop=False
+            )
+            self.assertLess(iterations, old_iterations)
+            for circuit in (out, old):
+                self.assertTrue(Operator.from_circuit(circuit).equiv(Operator(qc)))
+                self.assertTrue(_rzz_in_bounds(circuit))
 
     def test_level_three_unbounded_absorbs_as_level_two(self):
         """O3 on a Target without angle bounds moves controlled phases like O2."""
         target = _line_target(5, angle_bounded=False)
         qc = _phase_and_cx_circuit()
         for seed in (3, 7, 11):
-            out, moved = _compile_recording_moves(3, target, qc, seed)
-            self.assertTrue(set(moved) & _CONTROLLED_PHASE_GATES, moved)
+            out, moved, _ = _compile_recording_moves(3, target, qc, seed)
+            self.assertTrue(set(moved) & {"cp", "cu1", "cs", "csdg"}, moved)
             self.assertTrue(Operator.from_circuit(out).equiv(Operator(qc)))
-        # The O3 pass has the O2 configuration, so a routed input gets the same moves.
-        o2, o3 = (generate_preset_pass_manager(level, target=target) for level in (2, 3))
-        self.assertTrue(o2.translation._tasks[0][0].absorb_controlled_phase)
-        self.assertTrue(o3.translation._tasks[0][0].absorb_controlled_phase)
 
     @data(False, True)
-    def test_level_two_uses_default_pass(self, angle_bounded):
-        """O2 output equals that of the pass in its default configuration, on both Target kinds."""
+    def test_level_two_ignores_target_properties(self, angle_bounded):
+        """O2 output equals that of the pass built without a target, on both Target kinds."""
         target = _line_target(5, angle_bounded)
         cost = SparsePauliOp.from_sparse_list(
             [("ZZ", [i, j], 1.0) for i in range(5) for j in range(i + 1, 5)], num_qubits=5
@@ -249,13 +304,65 @@ class TestAbsorbIntoSwaps(QiskitTestCase):
                     with patch.object(
                         builtin_plugins.DefaultTranslationPassManager,
                         "pass_manager",
-                        _translation_stage_with_default_pass,
+                        _translation_stage_without_target,
                     ):
                         expected = generate_preset_pass_manager(
                             2, target=target, seed_transpiler=seed
                         ).run(qc)
                     self.assertEqual(out, expected)
                     self.assertEqual(out.layout, expected.layout)
+
+    def test_tail_rule_short_t2_unmeasured(self):
+        """A short-T2 qubit that is unmeasured and ends on one more pair keeps its SWAP alone."""
+        qc = _tail_circuit()
+        dag = circuit_to_dag(qc)
+        self.assertEqual(len(_find_moves(dag)[2]), 1)
+        self.assertEqual(len(_find_moves(dag, frozenset({1}))[2]), 0)
+        self.assertEqual(len(_find_moves(dag, frozenset({2, 3}))[2]), 1)
+        short = _t2_target(4, [100e-6, 8e-6, 100e-6, 100e-6])
+        self.assertEqual(_AbsorbIntoSwaps(target=short).run(circuit_to_dag(qc)), dag)
+        out = dag_to_circuit(_AbsorbIntoSwaps().run(circuit_to_dag(qc)))
+        self.assertNotEqual(out, qc)
+        self.assertEqual(Operator(out), Operator(qc))
+
+    @data("measure", "other_pair")
+    def test_tail_rule_does_not_apply(self, variant):
+        """A measured qubit, or one with work on two more pairs, still gets the move."""
+        qc = _tail_circuit(**{variant: True})
+        dag = circuit_to_dag(qc)
+        self.assertEqual(len(_find_moves(dag, frozenset({1}))[2]), 1)
+        short = _t2_target(4, [100e-6, 8e-6, 100e-6, 100e-6])
+        out = dag_to_circuit(_AbsorbIntoSwaps(target=short).run(dag))
+        self.assertNotEqual(out, qc)
+        if variant == "other_pair":
+            self.assertEqual(Operator(out), Operator(qc))
+
+    def test_tail_rule_barrier_does_not_pin(self):
+        """A final barrier is no measurement and no multi-qubit work for the tail rule."""
+        dag = circuit_to_dag(_tail_circuit(final_barrier=True))
+        self.assertEqual(len(_find_moves(dag, frozenset({1}))[2]), 0)
+        dag = circuit_to_dag(_tail_circuit(final_barrier=True, measure=True))
+        self.assertEqual(len(_find_moves(dag, frozenset({1}))[2]), 1)
+
+    def test_short_t2_qubits(self):
+        """The tail rule reads the qubit T2 times of the Target."""
+        threshold = _swap_absorption._TAIL_T2_THRESHOLD
+        target = _t2_target(4, [threshold / 2, threshold, None, 2 * threshold])
+        self.assertEqual(_short_t2_qubits(target, 4), frozenset({0}))
+        self.assertEqual(_short_t2_qubits(target, 0), frozenset())
+        self.assertEqual(_short_t2_qubits(_line_target(4, False), 4), frozenset())
+        self.assertEqual(_short_t2_qubits(None, 4), frozenset())
+
+    @data(2, 3)
+    def test_preset_tail_rule_uses_target(self, level):
+        """The preset pipeline applies the tail rule at O3 only."""
+        qc = _tail_circuit()
+        for t2, expected in ((8e-6, 0 if level == 3 else 1), (100e-6, 1)):
+            target = _t2_target(4, [100e-6, t2, 100e-6, 100e-6])
+            pm = generate_preset_pass_manager(level, target=target, initial_layout=[0, 1, 2, 3])
+            absorb = pm.translation._tasks[0][0]
+            moves = _find_moves(circuit_to_dag(qc), _short_t2_qubits(absorb.target, 4))[2]
+            self.assertEqual(len(moves), expected)
 
     def test_every_governed_gate_moves_equivalently(self):
         """Each table entry is exercised as a candidate or a commuting intervening gate."""

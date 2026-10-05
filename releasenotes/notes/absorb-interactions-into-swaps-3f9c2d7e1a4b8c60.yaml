@@ -19,7 +19,7 @@ upgrade_transpiler:
     Routed circuits with many commuting interactions, such as QAOA circuits, can need fewer
     two-qubit gates, while total depth can rise where a merged block needs more single-qubit
     gates.  Layout and routing are unchanged.  A ``swap`` is left in place when one of its qubits
-    does no further multi-qubit work after it.  At ``optimization_level=3`` on a
-    :class:`.Target` with angle bounds, for example a fractional ``rzz``, controlled phases
-    (``cp``, ``cu1``, ``cs`` and ``csdg``) are not moved, because the merged blocks would make the
-    optimization loop run for many more iterations.
+    does no further multi-qubit work after it.  At ``optimization_level=3`` a ``swap`` is also
+    left in place when one of its qubits has a :class:`.Target` T2 below 10 microseconds, is not
+    measured afterwards, and all its remaining multi-qubit operations, other than the moved
+    interaction, act on the same set of qubits.
