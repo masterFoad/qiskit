@@ -308,7 +308,6 @@ def generate_routing_passmanager(
     check_trivial=False,
     use_barrier_before_measurement=True,
     vf2_max_trials=None,
-    optimization_level=None,
 ):
     """Generate a routing :class:`~qiskit.transpiler.PassManager`
 
@@ -338,11 +337,6 @@ def generate_routing_passmanager(
         vf2_max_trials (int): The maximum number of trials to run VF2 when
             evaluating the vf2 post layout
             pass. If this is ``None`` or ``0`` the vf2 post layout will not be run.
-        optimization_level (int): The optimization level of the preset pass manager this
-            routing stage is built for. At levels 2 and 3, the stage ends by moving two-qubit
-            interactions next to the ``swap`` gates on the same qubit pair, so that the
-            optimization stage can synthesize each ``swap`` and interaction as one block. If
-            ``None`` (the default), this step is not added.
     Returns:
         PassManager: The routing pass manager
     """
@@ -401,13 +395,6 @@ def generate_routing_passmanager(
 
     routing.append([FilterOpNodes(filter_fn)])
 
-    if optimization_level in (2, 3):
-        # Run after VF2PostLayout, so the tail rule reads the T2 of the final physical qubits, and
-        # after the routing barrier, which would block moves, is removed. Only the level 3 loop
-        # can leave single-qubit gates after a short-T2 qubit's last two-qubit gate, so only
-        # level 3 passes the target for the tail rule.
-        routing.append(_AbsorbIntoSwaps(target=target if optimization_level == 3 else None))
-
     return routing
 
 
@@ -462,6 +449,7 @@ def generate_translation_passmanager(
     unitary_synthesis_plugin_config: dict | None = None,
     hls_config: HLSConfig | None = None,
     qubits_initially_zero: bool = True,
+    optimization_level: int | None = None,
 ):
     """Generate a basis translation :class:`~qiskit.transpiler.PassManager`
 
@@ -490,6 +478,11 @@ def generate_translation_passmanager(
             Specifies how to synthesize various high-level objects.
         qubits_initially_zero: Indicates whether the input circuit is
             zero-initialized.
+        optimization_level: The optimization level of the preset pass manager this
+            translation stage is built for. At levels 2 and 3, the stage starts by moving
+            two-qubit interactions next to the ``swap`` gates on the same qubit pair, so that
+            the optimization stage can synthesize each ``swap`` and interaction as one block.
+            If ``None`` (the default), this step is not added.
 
     Returns:
         PassManager: The basis translation pass manager
@@ -497,8 +490,13 @@ def generate_translation_passmanager(
     Raises:
         TranspilerError: If the ``method`` kwarg is not a valid value
     """
+    absorb = []
+    if optimization_level in (2, 3):
+        # Only the level 3 loop re-runs the peephole on the blocks around a merged swap, so only
+        # there can a short-T2 qubit be left with trailing single-qubit gates.
+        absorb.append(_AbsorbIntoSwaps(target=target if optimization_level == 3 else None))
     if basis_gates is None and target is None:
-        return PassManager([])
+        return PassManager(absorb)
 
     if method == "translator":
         translator = BasisTranslator(sel, basis_gates, target)
@@ -605,7 +603,7 @@ def generate_translation_passmanager(
         )
     if target is not None and target.has_angle_bounds():
         unroll.append(WrapAngles(target))
-    return PassManager(unroll)
+    return PassManager(absorb + unroll)
 
 
 def generate_scheduling(instruction_durations, scheduling_method, timing_constraints, target=None):

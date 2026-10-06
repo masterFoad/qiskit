@@ -1,23 +1,26 @@
 ---
 features_transpiler:
   - |
-    The routing stage of the preset pass managers at ``optimization_level`` 2 and 3 now ends by
-    moving a two-qubit interaction on the qubit pair of a ``swap`` directly next to that
+    The translation stage of the preset pass managers at ``optimization_level`` 2 and 3 now
+    starts by moving a two-qubit interaction on the qubit pair of a ``swap`` directly next to that
     ``swap``, when the interaction commutes with every operation in between on those two qubits.
-    Because this is part of the routing stage, it also runs when a backend selects its own
-    translation stage plugin.  The :class:`.TwoQubitPeepholeOptimization` pass then synthesizes
-    the ``swap`` and the interaction as a single block, for example two two-qubit gates instead of
-    four for a ``swap`` followed by a ``cx``, or three instead of five for a ``swap`` next to a
-    ``cp`` on a ``cx`` or ``cz`` target.  Moved interactions are standard gates such as ``cx``,
-    ``cz``, ``cp``, ``rzz`` and ``rxx``, diagonal two-qubit :class:`.UnitaryGate` instances, and
-    ``cx``-``rz``-``cx`` blocks.  Commutation is decided exactly, and an interaction is never moved
-    across a ``swap``.  This follows the optimization-aware SWAP cost of
+    The :class:`.TwoQubitPeepholeOptimization` pass then synthesizes the ``swap`` and the
+    interaction as a single block, for example two two-qubit gates instead of four for a ``swap``
+    followed by a ``cx``, or three instead of five for a ``swap`` next to a ``cp`` on a ``cx`` or
+    ``cz`` target.  Moved interactions are standard gates such as ``cx``, ``cz``, ``cp``, ``rzz``
+    and ``rxx``, diagonal two-qubit :class:`.UnitaryGate` instances, and ``cx``-``rz``-``cx``
+    blocks.  Commutation is decided exactly, and an interaction is never moved across a ``swap``.
+    This follows the optimization-aware SWAP cost of
     `Liu, Li and Zhou <https://arxiv.org/abs/2205.10596>`__ and the dressed-SWAP synthesis of
     `Lao and Browne <https://arxiv.org/abs/2108.02099>`__.
   - |
-    Added a new argument ``optimization_level`` to :func:`.generate_routing_passmanager`.  When it
-    is 2 or 3, the generated routing stage ends with the step that moves two-qubit interactions
-    next to ``swap`` gates.  When it is ``None`` (the default), the routing stage is unchanged.
+    Added a new argument ``optimization_level`` to :func:`.generate_translation_passmanager`.
+    When it is 2 or 3, the generated translation stage starts with the step that moves two-qubit
+    interactions next to ``swap`` gates.  When it is ``None`` (the default), the translation stage
+    is unchanged.  The built-in ``translator`` and ``synthesis`` translation stage plugins pass
+    their optimization level.  A translation stage plugin that builds its stage with
+    :func:`.generate_translation_passmanager` can pass its ``optimization_level`` to include this
+    step.
 upgrade_transpiler:
   - |
     The output of :func:`.transpile` and :func:`.generate_preset_pass_manager` at
@@ -32,8 +35,8 @@ upgrade_transpiler:
     has a :class:`.Target` T2 below 10 microseconds, is not measured afterwards, and all its
     remaining multi-qubit operations, other than the moved interaction, act on the same set of
     qubits.
-    Routing stage plugins that do not pass ``optimization_level`` to
-    :func:`.generate_routing_passmanager` do not run this step.
+    Translation stage plugins that do not pass ``optimization_level`` to
+    :func:`.generate_translation_passmanager` do not run this step.
 fixes:
   - |
     The optimization loop of the preset pass managers at ``optimization_level=3`` now runs

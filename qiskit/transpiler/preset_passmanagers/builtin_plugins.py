@@ -221,6 +221,7 @@ class BasisTranslatorPassManager(PassManagerStagePlugin):
             unitary_synthesis_plugin_config=pass_manager_config.unitary_synthesis_plugin_config,
             hls_config=pass_manager_config.hls_config,
             qubits_initially_zero=pass_manager_config.qubits_initially_zero,
+            optimization_level=optimization_level,
         )
 
 
@@ -238,6 +239,7 @@ class UnitarySynthesisPassManager(PassManagerStagePlugin):
             unitary_synthesis_plugin_config=pass_manager_config.unitary_synthesis_plugin_config,
             hls_config=pass_manager_config.hls_config,
             qubits_initially_zero=pass_manager_config.qubits_initially_zero,
+            optimization_level=optimization_level,
         )
 
 
@@ -297,7 +299,6 @@ class BasicSwapPassManager(PassManagerStagePlugin):
                 vf2_max_trials=vf2_max_trials,
                 seed_transpiler=-1,
                 use_barrier_before_measurement=True,
-                optimization_level=2,
             )
         if optimization_level == 3:
             return common.generate_routing_passmanager(
@@ -308,7 +309,6 @@ class BasicSwapPassManager(PassManagerStagePlugin):
                 vf2_max_trials=vf2_max_trials,
                 seed_transpiler=-1,
                 use_barrier_before_measurement=True,
-                optimization_level=3,
             )
         raise TranspilerError(f"Invalid optimization level specified: {optimization_level}")
 
@@ -359,7 +359,6 @@ class LookaheadSwapPassManager(PassManagerStagePlugin):
                 vf2_max_trials=vf2_max_trials,
                 seed_transpiler=-1,
                 use_barrier_before_measurement=True,
-                optimization_level=2,
             )
         if optimization_level == 3:
             routing_pass = LookaheadSwap(coupling_map_routing, search_depth=5, search_width=6)
@@ -371,7 +370,6 @@ class LookaheadSwapPassManager(PassManagerStagePlugin):
                 vf2_max_trials=vf2_max_trials,
                 seed_transpiler=-1,
                 use_barrier_before_measurement=True,
-                optimization_level=3,
             )
         raise TranspilerError(f"Invalid optimization level specified: {optimization_level}")
 
@@ -442,7 +440,6 @@ class SabreSwapPassManager(PassManagerStagePlugin):
                 vf2_max_trials=vf2_max_trials,
                 seed_transpiler=-1,
                 use_barrier_before_measurement=True,
-                optimization_level=2,
             )
         if optimization_level == 3:
             trial_count = _get_trial_count(20)
@@ -460,7 +457,6 @@ class SabreSwapPassManager(PassManagerStagePlugin):
                 vf2_max_trials=vf2_max_trials,
                 seed_transpiler=-1,
                 use_barrier_before_measurement=True,
-                optimization_level=3,
             )
         raise TranspilerError(f"Invalid optimization level specified: {optimization_level}")
 
@@ -483,7 +479,6 @@ class NoneRoutingPassManager(PassManagerStagePlugin):
             coupling_map=coupling_map,
             seed_transpiler=-1,
             use_barrier_before_measurement=True,
-            optimization_level=optimization_level,
         )
 
 

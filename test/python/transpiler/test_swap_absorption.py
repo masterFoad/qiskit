@@ -12,7 +12,9 @@
 
 """Test the placement of two-qubit interactions next to routing SWAPs."""
 
+import collections
 import contextlib
+import copy
 import math
 import random
 from unittest.mock import patch
@@ -42,8 +44,9 @@ from qiskit.passmanager.flow_controllers import DoWhileController
 from qiskit.providers import QubitProperties
 from qiskit.providers.fake_provider import GenericBackendV2
 from qiskit.quantum_info import Operator, SparsePauliOp
-from qiskit.transpiler import CouplingMap, Target, generate_preset_pass_manager
-from qiskit.transpiler.passes import SabreSwap, TwoQubitPeepholeOptimization, WrapAngles
+from qiskit.transpiler import CouplingMap, PassManager, Target, generate_preset_pass_manager
+from qiskit.transpiler.basepasses import AnalysisPass
+from qiskit.transpiler.passes import TwoQubitPeepholeOptimization, WrapAngles
 from qiskit.transpiler.passes.utils.wrap_angles import WrapAngleRegistry
 from qiskit.transpiler.preset_passmanagers import common
 from qiskit.transpiler.preset_passmanagers import _swap_absorption
@@ -184,13 +187,25 @@ def _qaoa(reps):
     return qaoa_ansatz(cost, reps=reps).assign_parameters([0.4, 0.9, 0.2, 0.7][: 2 * reps])
 
 
-def _compile(level, circuit, absorb=True, wrap_in_loop=True, **kwargs):
+class _Snapshot(AnalysisPass):
+    """Append a copy of the circuit and of its layout to ``snapshots``."""
+
+    def __init__(self, snapshots):
+        super().__init__()
+        self.snapshots = snapshots
+
+    def run(self, dag):
+        self.snapshots.append((copy.deepcopy(dag), copy.deepcopy(self.property_set["layout"])))
+
+
+def _compile(level, circuit, absorb=True, wrap_in_loop=True, snapshots=None, **kwargs):
     """Compile with the preset pass manager.
 
     Return the output, the names of the moved interactions and the number of level 3 loop
     iterations (runs of the in-loop two-qubit peephole).  ``absorb=False`` makes the pass leave
     every circuit unchanged, as a control, and ``wrap_in_loop=False`` removes ``WrapAngles`` from
-    the level 3 loop.
+    the level 3 loop.  A ``snapshots`` list receives the circuit after the init and the routing
+    stages.
     """
     moved = []
     original = _swap_absorption._find_moves
@@ -218,6 +233,9 @@ def _compile(level, circuit, absorb=True, wrap_in_loop=True, **kwargs):
         ),
     ):
         pm = generate_preset_pass_manager(level, **kwargs)
+        if snapshots is not None:
+            pm.post_init = PassManager([_Snapshot(snapshots)])
+            pm.post_routing = PassManager([_Snapshot(snapshots)])
         if not wrap_in_loop:
             for controller in pm.optimization._tasks:
                 for task in controller:
@@ -236,22 +254,45 @@ def _rzz_in_bounds(circuit):
     )
 
 
-def _routing_absorb(pm):
-    """The ``_AbsorbIntoSwaps`` step at the end of the routing stage of ``pm``, or ``None``."""
-    if pm.routing is None:
-        return None
-    last = pm.routing._tasks[-1][0]
-    return last if isinstance(last, _AbsorbIntoSwaps) else None
+def _translation_absorb(pm):
+    """The ``_AbsorbIntoSwaps`` step that starts the translation stage of ``pm``, or ``None``."""
+    first = pm.translation._tasks[0][0] if pm.translation._tasks else None
+    return first if isinstance(first, _AbsorbIntoSwaps) else None
 
 
-def _translation_absorbs(pm):
-    """Whether the translation stage of ``pm`` contains ``_AbsorbIntoSwaps``."""
-    tasks = [task for tasks in pm.translation._tasks for task in tasks]
+def _routing_absorbs(pm):
+    """Whether the routing stage of ``pm`` contains ``_AbsorbIntoSwaps``."""
+    tasks = [task for tasks in pm.routing._tasks for task in tasks] if pm.routing else []
     return any(isinstance(task, _AbsorbIntoSwaps) for task in tasks)
 
 
+def _replays(virtual, routed, layout):
+    """Whether ``routed`` is ``virtual`` placed by ``layout``, with only swaps added."""
+    pending = {qubit: collections.deque() for qubit in virtual.qubits}
+    for node in virtual.topological_op_nodes():
+        for qubit in node.qargs:
+            pending[qubit].append(node)
+    held = {index: qubit for qubit, index in layout.get_virtual_bits().items()}
+    for node in routed.topological_op_nodes():
+        physical = [routed.find_bit(qubit).index for qubit in node.qargs]
+        qubits = [held[index] for index in physical]
+        heads = {pending[q][0] if pending.get(q) else None for q in qubits}
+        head = heads.pop() if len(heads) == 1 else None
+        if head is not None and head.op == node.op and list(head.qargs) == qubits:
+            for qubit in qubits:
+                pending[qubit].popleft()
+        elif node.name == "swap":
+            held[physical[0]], held[physical[1]] = held[physical[1]], held[physical[0]]
+        else:
+            return False
+    return not any(pending.values())
+
+
 class _MockTranslationPlugin(PassManagerStagePlugin):
-    """A translation plugin built like the ones of external providers, without the pass."""
+    """A translation plugin built like the ones of external providers."""
+
+    def __init__(self, pass_level):
+        self.pass_level = pass_level
 
     def pass_manager(self, pass_manager_config, optimization_level=None):
         return common.generate_translation_passmanager(
@@ -261,23 +302,29 @@ class _MockTranslationPlugin(PassManagerStagePlugin):
             coupling_map=pass_manager_config.coupling_map,
             hls_config=pass_manager_config.hls_config,
             qubits_initially_zero=pass_manager_config.qubits_initially_zero,
+            optimization_level=optimization_level if self.pass_level else None,
         )
 
 
 class _ProviderPluginBackend(GenericBackendV2):
     """A backend that selects its own translation stage plugin, as hardware providers do."""
 
+    plugin = "mock_provider"
+
     def get_translation_stage_plugin(self):
-        return "mock_provider"
+        return self.plugin
 
 
-def _with_mock_translation_plugin():
-    """Make the plugin name ``"mock_provider"`` build ``_MockTranslationPlugin``."""
+def _with_mock_translation_plugins():
+    """Make ``"mock_provider"`` and ``"mock_provider_no_level"`` build ``_MockTranslationPlugin``,
+    which passes its optimization level to the helper only in the first."""
+    plugins = {"mock_provider": True, "mock_provider_no_level": False}
     original = PassManagerStagePluginManager.get_passmanager_stage
 
     def get_passmanager_stage(self, stage_name, plugin_name, pm_config, optimization_level=None):
-        if stage_name == "translation" and plugin_name == "mock_provider":
-            return _MockTranslationPlugin().pass_manager(pm_config, optimization_level)
+        if stage_name == "translation" and plugin_name in plugins:
+            plugin = _MockTranslationPlugin(plugins[plugin_name])
+            return plugin.pass_manager(pm_config, optimization_level)
         return original(self, stage_name, plugin_name, pm_config, optimization_level)
 
     return patch.object(
@@ -318,37 +365,47 @@ class TestAbsorbIntoSwaps(QiskitTestCase):
         (3, True, True),
     )
     def test_preset_absorption_levels(self, setting):
-        """O2 and O3 end the routing stage with the pass, and translation does not run it."""
+        """O2 and O3 start the translation stage with the pass, and routing does not run it."""
         level, angle_bounded, enabled = setting
         target = _line_target(4, angle_bounded)
         self.assertEqual(target.has_angle_bounds(), angle_bounded)
         pm = generate_preset_pass_manager(level, target=target)
-        absorb = _routing_absorb(pm)
+        absorb = _translation_absorb(pm)
         self.assertEqual(absorb is not None, enabled)
         if enabled:
             # Only level 3 gives the pass the target, for the tail rule.
             self.assertIs(absorb.target, target if level == 3 else None)
-        self.assertFalse(_translation_absorbs(pm))
+        self.assertFalse(_routing_absorbs(pm))
 
     def test_preset_absorption_without_target(self):
-        """Basis gates with a coupling map get the pass at O2 and O3; alone, there is no routing."""
+        """Basis gates, with or without a coupling map, also get the pass at O2 and O3."""
         basis = ["cx", "rz", "sx", "x"]
         for level in (2, 3):
+            for coupling_map in (CouplingMap.from_line(4), None):
+                pm = generate_preset_pass_manager(
+                    level, basis_gates=basis, coupling_map=coupling_map
+                )
+                self.assertIsInstance(_translation_absorb(pm), _AbsorbIntoSwaps)
+
+    @data("translator", "synthesis")
+    def test_builtin_translation_plugins(self, method):
+        """The built-in translation plugins pass their level, so they also run the pass."""
+        for level in (1, 2, 3):
             pm = generate_preset_pass_manager(
-                level, basis_gates=basis, coupling_map=CouplingMap.from_line(4)
+                level, target=_line_target(4), translation_method=method
             )
-            self.assertIsInstance(_routing_absorb(pm), _AbsorbIntoSwaps)
-            self.assertIsNone(generate_preset_pass_manager(level, basis_gates=basis).routing)
+            self.assertEqual(_translation_absorb(pm) is not None, level in (2, 3))
 
     @data(None, 0, 1, 2, 3)
-    def test_routing_passmanager_optimization_level(self, level):
-        """``generate_routing_passmanager`` adds the pass only when given level 2 or 3."""
+    def test_translation_passmanager_optimization_level(self, level):
+        """``generate_translation_passmanager`` adds the pass only when given level 2 or 3."""
         target = _line_target(4)
-        routing = common.generate_routing_passmanager(
-            SabreSwap(target), target, optimization_level=level
-        )
-        last = routing._tasks[-1][0]
-        self.assertEqual(isinstance(last, _AbsorbIntoSwaps), level in (2, 3))
+        for translation in (
+            common.generate_translation_passmanager(target, optimization_level=level),
+            common.generate_translation_passmanager(None, optimization_level=level),
+        ):
+            first = translation._tasks[0][0] if translation._tasks else None
+            self.assertEqual(isinstance(first, _AbsorbIntoSwaps), level in (2, 3))
 
     @data((2, False), (2, True), (3, False), (3, True))
     def test_wrap_angles_in_level_three_loop(self, setting):
@@ -445,7 +502,7 @@ class TestAbsorbIntoSwaps(QiskitTestCase):
         for t2, expected in ((8e-6, 0 if level == 3 else 1), (100e-6, 1)):
             target = _line_target(4, t2=[100e-6, t2, 100e-6, 100e-6])
             pm = generate_preset_pass_manager(level, target=target, initial_layout=[0, 1, 2, 3])
-            absorb = _routing_absorb(pm)
+            absorb = _translation_absorb(pm)
             moves = _find_moves(circuit_to_dag(qc), _short_t2_qubits(absorb.target, 4))[2]
             self.assertEqual(len(moves), expected)
 
@@ -799,17 +856,35 @@ class TestAbsorbIntoSwaps(QiskitTestCase):
 
     @data(2, 3)
     def test_provider_translation_plugin(self, level):
-        """A backend's own translation plugin gives the same output as the default plugin."""
+        """A provider translation plugin that passes its level gets the default plugin's output."""
         qc = _qft(8, measure=True)
-        with _with_mock_translation_plugin():
-            backend = _heavy_hex_backend(_ProviderPluginBackend)
-            pm = generate_preset_pass_manager(level, backend=backend, seed_transpiler=1)
-            self.assertFalse(_translation_absorbs(pm))
-            self.assertIsInstance(_routing_absorb(pm), _AbsorbIntoSwaps)
-            out, moved, _ = _compile(level, qc, backend=backend, seed_transpiler=1)
-        self.assertGreater(len(moved), 0)
         expected, default_moved, _ = _compile(
             level, qc, backend=_heavy_hex_backend(), seed_transpiler=1
         )
+        with _with_mock_translation_plugins():
+            backend = _heavy_hex_backend(_ProviderPluginBackend)
+            pm = generate_preset_pass_manager(level, backend=backend, seed_transpiler=1)
+            self.assertIsInstance(_translation_absorb(pm), _AbsorbIntoSwaps)
+            out, moved, _ = _compile(level, qc, backend=backend, seed_transpiler=1)
+            backend.plugin = "mock_provider_no_level"
+            pm = generate_preset_pass_manager(level, backend=backend, seed_transpiler=1)
+            self.assertIsNone(_translation_absorb(pm))
+            _, unmoved, _ = _compile(level, qc, backend=backend, seed_transpiler=1)
+        self.assertGreater(len(moved), 0)
         self.assertEqual(moved, default_moved)
         self.assertEqual(out, expected)
+        self.assertEqual(unmoved, [])
+
+    @data(2, 3)
+    def test_routing_stage_adds_only_swaps(self, level):
+        """The routing stage's output is the init stage's output, laid out, plus swaps only."""
+        for qc, kwargs in (
+            (_phase_and_cx_circuit(6), {"target": _line_target(6)}),
+            (_qft(8, measure=True), {"backend": _heavy_hex_backend()}),
+        ):
+            snapshots = []
+            _, moved, _ = _compile(level, qc, snapshots=snapshots, seed_transpiler=1, **kwargs)
+            self.assertGreater(len(moved), 0)
+            (virtual, _), (routed, layout) = snapshots
+            self.assertIn("swap", routed.count_ops())
+            self.assertTrue(_replays(virtual, routed, layout))
