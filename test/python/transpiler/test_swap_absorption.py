@@ -25,12 +25,17 @@ from qiskit.converters import circuit_to_dag, dag_to_circuit
 from qiskit.dagcircuit import DAGCircuit
 from qiskit.passmanager.flow_controllers import DoWhileController
 from qiskit.providers import QubitProperties
+from qiskit.providers.fake_provider import GenericBackendV2
 from qiskit.quantum_info import Operator, SparsePauliOp
-from qiskit.transpiler import CouplingMap, PassManager, Target, generate_preset_pass_manager
-from qiskit.transpiler.passes import TwoQubitPeepholeOptimization, WrapAngles
+from qiskit.transpiler import CouplingMap, Target, generate_preset_pass_manager
+from qiskit.transpiler.passes import SabreSwap, TwoQubitPeepholeOptimization, WrapAngles
 from qiskit.transpiler.passes.utils.wrap_angles import WrapAngleRegistry
-from qiskit.transpiler.preset_passmanagers import builtin_plugins
+from qiskit.transpiler.preset_passmanagers import common
 from qiskit.transpiler.preset_passmanagers import _swap_absorption
+from qiskit.transpiler.preset_passmanagers.plugin import (
+    PassManagerStagePlugin,
+    PassManagerStagePluginManager,
+)
 from qiskit.transpiler.preset_passmanagers._swap_absorption import (
     _AbsorbIntoSwaps,
     _WIRE_PAULIS,
@@ -158,14 +163,73 @@ def _rzz_in_bounds(circuit):
     )
 
 
-def _translation_stage_without_target(self, pass_manager_config, optimization_level=None):
-    """The default translation stage with the level 2 pass built without a target."""
-    translation = builtin_plugins.BasisTranslatorPassManager().pass_manager(
-        pass_manager_config, optimization_level
+def _routing_absorb(pm):
+    """The ``_AbsorbIntoSwaps`` step at the end of the routing stage of ``pm``, or ``None``."""
+    if pm.routing is None:
+        return None
+    last = pm.routing._tasks[-1][0]
+    return last if isinstance(last, _AbsorbIntoSwaps) else None
+
+
+def _translation_absorbs(pm):
+    """Whether the translation stage of ``pm`` contains ``_AbsorbIntoSwaps``."""
+    tasks = [task for tasks in pm.translation._tasks for task in tasks]
+    return any(isinstance(task, _AbsorbIntoSwaps) for task in tasks)
+
+
+def _without_absorption():
+    """Patch ``_AbsorbIntoSwaps`` to leave every circuit unchanged, as a control."""
+    return patch.object(_AbsorbIntoSwaps, "run", lambda self, dag: dag)
+
+
+def _count_moves(level, circuit, **kwargs):
+    """Compile ``circuit`` with the preset pass manager and count the moves the pass makes."""
+    moves = []
+    original = _swap_absorption._find_moves
+
+    def counting(dag, *args):
+        result = original(dag, *args)
+        moves.extend(result[2])
+        return result
+
+    with patch.object(_swap_absorption, "_find_moves", counting):
+        out = generate_preset_pass_manager(level, **kwargs).run(circuit)
+    return out, len(moves)
+
+
+class _MockTranslationPlugin(PassManagerStagePlugin):
+    """A translation plugin built like the ones of external providers, without the pass."""
+
+    def pass_manager(self, pass_manager_config, optimization_level=None):
+        return common.generate_translation_passmanager(
+            pass_manager_config.target,
+            basis_gates=pass_manager_config.basis_gates,
+            approximation_degree=pass_manager_config.approximation_degree,
+            coupling_map=pass_manager_config.coupling_map,
+            hls_config=pass_manager_config.hls_config,
+            qubits_initially_zero=pass_manager_config.qubits_initially_zero,
+        )
+
+
+class _ProviderPluginBackend(GenericBackendV2):
+    """A backend that selects its own translation stage plugin, as hardware providers do."""
+
+    def get_translation_stage_plugin(self):
+        return "mock_provider"
+
+
+def _with_mock_translation_plugin():
+    """Make the plugin name ``"mock_provider"`` build ``_MockTranslationPlugin``."""
+    original = PassManagerStagePluginManager.get_passmanager_stage
+
+    def get_passmanager_stage(self, stage_name, plugin_name, pm_config, optimization_level=None):
+        if stage_name == "translation" and plugin_name == "mock_provider":
+            return _MockTranslationPlugin().pass_manager(pm_config, optimization_level)
+        return original(self, stage_name, plugin_name, pm_config, optimization_level)
+
+    return patch.object(
+        PassManagerStagePluginManager, "get_passmanager_stage", get_passmanager_stage
     )
-    if optimization_level == 2:
-        translation = PassManager([_AbsorbIntoSwaps()]) + translation
-    return translation
 
 
 def _tail_circuit(measure=False, other_pair=False, final_barrier=False):
@@ -212,22 +276,37 @@ class TestAbsorbIntoSwaps(QiskitTestCase):
         (3, True, True),
     )
     def test_preset_absorption_levels(self, setting):
-        """O2 and O3 include the pass, whether or not the Target has angle bounds."""
+        """O2 and O3 end the routing stage with the pass, and translation does not run it."""
         level, angle_bounded, enabled = setting
         target = _line_target(4, angle_bounded)
         self.assertEqual(target.has_angle_bounds(), angle_bounded)
         pm = generate_preset_pass_manager(level, target=target)
-        first = pm.translation._tasks[0][0]
-        self.assertEqual(isinstance(first, _AbsorbIntoSwaps), enabled)
+        absorb = _routing_absorb(pm)
+        self.assertEqual(absorb is not None, enabled)
         if enabled:
             # Only level 3 gives the pass the target, for the tail rule.
-            self.assertIs(first.target, target if level == 3 else None)
+            self.assertIs(absorb.target, target if level == 3 else None)
+        self.assertFalse(_translation_absorbs(pm))
 
     def test_preset_absorption_without_target(self):
-        """Basis gates alone also get the pass at O2 and O3."""
+        """Basis gates with a coupling map get the pass at O2 and O3; alone, there is no routing."""
+        basis = ["cx", "rz", "sx", "x"]
         for level in (2, 3):
-            pm = generate_preset_pass_manager(level, basis_gates=["cx", "rz", "sx", "x"])
-            self.assertIsInstance(pm.translation._tasks[0][0], _AbsorbIntoSwaps)
+            pm = generate_preset_pass_manager(
+                level, basis_gates=basis, coupling_map=CouplingMap.from_line(4)
+            )
+            self.assertIsInstance(_routing_absorb(pm), _AbsorbIntoSwaps)
+            self.assertIsNone(generate_preset_pass_manager(level, basis_gates=basis).routing)
+
+    @data(None, 0, 1, 2, 3)
+    def test_routing_passmanager_optimization_level(self, level):
+        """``generate_routing_passmanager`` adds the pass only when given level 2 or 3."""
+        target = _line_target(4, False)
+        routing = common.generate_routing_passmanager(
+            SabreSwap(target), target, optimization_level=level
+        )
+        last = routing._tasks[-1][0]
+        self.assertEqual(isinstance(last, _AbsorbIntoSwaps), level in (2, 3))
 
     @data((2, False), (2, True), (3, False), (3, True))
     def test_wrap_angles_in_level_three_loop(self, setting):
@@ -302,9 +381,7 @@ class TestAbsorbIntoSwaps(QiskitTestCase):
                         qc
                     )
                     with patch.object(
-                        builtin_plugins.DefaultTranslationPassManager,
-                        "pass_manager",
-                        _translation_stage_without_target,
+                        common, "_AbsorbIntoSwaps", lambda target=None: _AbsorbIntoSwaps()
                     ):
                         expected = generate_preset_pass_manager(
                             2, target=target, seed_transpiler=seed
@@ -360,7 +437,7 @@ class TestAbsorbIntoSwaps(QiskitTestCase):
         for t2, expected in ((8e-6, 0 if level == 3 else 1), (100e-6, 1)):
             target = _t2_target(4, [100e-6, t2, 100e-6, 100e-6])
             pm = generate_preset_pass_manager(level, target=target, initial_layout=[0, 1, 2, 3])
-            absorb = pm.translation._tasks[0][0]
+            absorb = _routing_absorb(pm)
             moves = _find_moves(circuit_to_dag(qc), _short_t2_qubits(absorb.target, 4))[2]
             self.assertEqual(len(moves), expected)
 
@@ -779,8 +856,78 @@ class TestAbsorbIntoSwaps(QiskitTestCase):
         )
         out = generate_preset_pass_manager(2, target=target, seed_transpiler=7).run(qc)
         self.assertEqual(Operator.from_circuit(out), Operator(qc))
-        # The "translator" plugin is the same translation stage without the absorption step.
-        without = generate_preset_pass_manager(
-            2, target=target, seed_transpiler=7, translation_method="translator"
-        ).run(qc)
+        with _without_absorption():
+            without = generate_preset_pass_manager(2, target=target, seed_transpiler=7).run(qc)
         self.assertLess(out.count_ops()["cz"], without.count_ops()["cz"])
+
+    def test_level_two_layout_unchanged(self):
+        """At O2 the pass runs after VF2PostLayout, so the layout equals that of the control."""
+        backend = GenericBackendV2(
+            num_qubits=19,
+            basis_gates=["cz", "rz", "sx", "x"],
+            coupling_map=CouplingMap.from_heavy_hex(3),
+            seed=7,
+        )
+        qft = QuantumCircuit(8)
+        qft.append(QFTGate(8), range(8))
+        qft.measure_all()
+        for qc in (qft, _phase_and_cx_circuit(6)):
+            for seed in (1, 2, 3):
+                out, moves = _count_moves(2, qc, backend=backend, seed_transpiler=seed)
+                self.assertGreater(moves, 0)
+                with _without_absorption():
+                    control = generate_preset_pass_manager(
+                        2, backend=backend, seed_transpiler=seed
+                    ).run(qc)
+                self.assertNotEqual(out, control)
+                self.assertEqual(out.layout, control.layout)
+
+    def test_level_three_initial_layout_kept(self):
+        """At O3 with an ``initial_layout`` the layout equals that of the control."""
+        target = _line_target(6, angle_bounded=False)
+        qc = _phase_and_cx_circuit(6)
+        initial_layout = [5, 3, 1, 0, 2, 4]
+        for seed in (1, 2, 3):
+            kwargs = {"target": target, "initial_layout": initial_layout, "seed_transpiler": seed}
+            out, moves = _count_moves(3, qc, **kwargs)
+            self.assertGreater(moves, 0)
+            with _without_absorption():
+                control = generate_preset_pass_manager(3, **kwargs).run(qc)
+            self.assertEqual(out.layout, control.layout)
+            self.assertEqual(out.layout.initial_index_layout()[:6], initial_layout)
+            self.assertTrue(Operator.from_circuit(out).equiv(Operator(qc)))
+
+    def test_level_three_default_layout_equivalent(self):
+        """At O3 the final VF2PostLayout can choose another layout, so only check equivalence."""
+        target = _line_target(6, angle_bounded=False)
+        qc = QuantumCircuit(6)
+        qc.append(QFTGate(6), range(6))
+        for seed in (1, 2, 3):
+            out, moves = _count_moves(3, qc, target=target, seed_transpiler=seed)
+            self.assertGreater(moves, 0)
+            self.assertTrue(Operator.from_circuit(out).equiv(Operator(qc)))
+
+    @data(2, 3)
+    def test_provider_translation_plugin(self, level):
+        """A backend's own translation plugin gives the same output as the default plugin."""
+        kwargs = {
+            "num_qubits": 19,
+            "basis_gates": ["cz", "rz", "sx", "x"],
+            "coupling_map": CouplingMap.from_heavy_hex(3),
+            "seed": 7,
+        }
+        qc = QuantumCircuit(8)
+        qc.append(QFTGate(8), range(8))
+        qc.measure_all()
+        with _with_mock_translation_plugin():
+            backend = _ProviderPluginBackend(**kwargs)
+            pm = generate_preset_pass_manager(level, backend=backend, seed_transpiler=1)
+            self.assertFalse(_translation_absorbs(pm))
+            self.assertIsInstance(_routing_absorb(pm), _AbsorbIntoSwaps)
+            out, moves = _count_moves(level, qc, backend=backend, seed_transpiler=1)
+        self.assertGreater(moves, 0)
+        expected, default_moves = _count_moves(
+            level, qc, backend=GenericBackendV2(**kwargs), seed_transpiler=1
+        )
+        self.assertEqual(moves, default_moves)
+        self.assertEqual(out, expected)
