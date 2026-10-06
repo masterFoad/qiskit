@@ -44,7 +44,6 @@ from qiskit.transpiler.passes import Collect1qRuns
 from qiskit.transpiler.passes import Collect2qBlocks
 from qiskit.transpiler.passes import GateDirection
 from qiskit.transpiler.preset_passmanagers import common
-from qiskit.transpiler.preset_passmanagers._swap_absorption import _AbsorbIntoSwaps
 from qiskit.transpiler.preset_passmanagers.plugin import (
     PassManagerStagePlugin,
     PassManagerStagePluginManager,
@@ -205,15 +204,7 @@ class DefaultTranslationPassManager(PassManagerStagePlugin):
         # start transitioning the default method without breaking the semantics of the default
         # string referring to the `BasisTranslator`.
 
-        translation = BasisTranslatorPassManager().pass_manager(
-            pass_manager_config, optimization_level
-        )
-        if optimization_level in (2, 3):
-            # Only the level 3 loop re-runs the peephole on the blocks around a merged swap, so
-            # only there can a short-T2 qubit be left with trailing single-qubit gates.
-            target = pass_manager_config.target if optimization_level == 3 else None
-            translation = PassManager([_AbsorbIntoSwaps(target=target)]) + translation
-        return translation
+        return BasisTranslatorPassManager().pass_manager(pass_manager_config, optimization_level)
 
 
 class BasisTranslatorPassManager(PassManagerStagePlugin):
@@ -306,6 +297,7 @@ class BasicSwapPassManager(PassManagerStagePlugin):
                 vf2_max_trials=vf2_max_trials,
                 seed_transpiler=-1,
                 use_barrier_before_measurement=True,
+                optimization_level=2,
             )
         if optimization_level == 3:
             return common.generate_routing_passmanager(
@@ -316,6 +308,7 @@ class BasicSwapPassManager(PassManagerStagePlugin):
                 vf2_max_trials=vf2_max_trials,
                 seed_transpiler=-1,
                 use_barrier_before_measurement=True,
+                optimization_level=3,
             )
         raise TranspilerError(f"Invalid optimization level specified: {optimization_level}")
 
@@ -366,6 +359,7 @@ class LookaheadSwapPassManager(PassManagerStagePlugin):
                 vf2_max_trials=vf2_max_trials,
                 seed_transpiler=-1,
                 use_barrier_before_measurement=True,
+                optimization_level=2,
             )
         if optimization_level == 3:
             routing_pass = LookaheadSwap(coupling_map_routing, search_depth=5, search_width=6)
@@ -377,6 +371,7 @@ class LookaheadSwapPassManager(PassManagerStagePlugin):
                 vf2_max_trials=vf2_max_trials,
                 seed_transpiler=-1,
                 use_barrier_before_measurement=True,
+                optimization_level=3,
             )
         raise TranspilerError(f"Invalid optimization level specified: {optimization_level}")
 
@@ -447,6 +442,7 @@ class SabreSwapPassManager(PassManagerStagePlugin):
                 vf2_max_trials=vf2_max_trials,
                 seed_transpiler=-1,
                 use_barrier_before_measurement=True,
+                optimization_level=2,
             )
         if optimization_level == 3:
             trial_count = _get_trial_count(20)
@@ -464,6 +460,7 @@ class SabreSwapPassManager(PassManagerStagePlugin):
                 vf2_max_trials=vf2_max_trials,
                 seed_transpiler=-1,
                 use_barrier_before_measurement=True,
+                optimization_level=3,
             )
         raise TranspilerError(f"Invalid optimization level specified: {optimization_level}")
 
@@ -486,6 +483,7 @@ class NoneRoutingPassManager(PassManagerStagePlugin):
             coupling_map=coupling_map,
             seed_transpiler=-1,
             use_barrier_before_measurement=True,
+            optimization_level=optimization_level,
         )
 
 

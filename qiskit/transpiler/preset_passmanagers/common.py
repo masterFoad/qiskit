@@ -51,6 +51,7 @@ from qiskit.transpiler.passes import VF2PostLayout
 from qiskit.transpiler.passes.layout.vf2_layout import VF2LayoutStopReason
 from qiskit.transpiler.passes.layout.vf2_post_layout import VF2PostLayoutStopReason
 from qiskit.transpiler.passes import WrapAngles
+from qiskit.transpiler.preset_passmanagers._swap_absorption import _AbsorbIntoSwaps
 from qiskit.transpiler.exceptions import TranspilerError
 from qiskit.transpiler.layout import Layout
 from qiskit.transpiler.optimization_metric import OptimizationMetric
@@ -307,6 +308,7 @@ def generate_routing_passmanager(
     check_trivial=False,
     use_barrier_before_measurement=True,
     vf2_max_trials=None,
+    optimization_level=None,
 ):
     """Generate a routing :class:`~qiskit.transpiler.PassManager`
 
@@ -336,6 +338,11 @@ def generate_routing_passmanager(
         vf2_max_trials (int): The maximum number of trials to run VF2 when
             evaluating the vf2 post layout
             pass. If this is ``None`` or ``0`` the vf2 post layout will not be run.
+        optimization_level (int): The optimization level of the preset pass manager this
+            routing stage is built for. At levels 2 and 3, the stage ends by moving two-qubit
+            interactions next to the ``swap`` gates on the same qubit pair, so that the
+            optimization stage can synthesize each ``swap`` and interaction as one block. If
+            ``None`` (the default), this step is not added.
     Returns:
         PassManager: The routing pass manager
     """
@@ -393,6 +400,13 @@ def generate_routing_passmanager(
         return node.label != "qiskit.transpiler.internal.routing.protection.barrier"
 
     routing.append([FilterOpNodes(filter_fn)])
+
+    if optimization_level in (2, 3):
+        # Run after VF2PostLayout, so the tail rule reads the T2 of the final physical qubits, and
+        # after the routing barrier, which would block moves, is removed. Only the level 3 loop
+        # can leave single-qubit gates after a short-T2 qubit's last two-qubit gate, so only
+        # level 3 passes the target for the tail rule.
+        routing.append(_AbsorbIntoSwaps(target=target if optimization_level == 3 else None))
 
     return routing
 
