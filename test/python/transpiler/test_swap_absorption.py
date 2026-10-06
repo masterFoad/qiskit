@@ -12,15 +12,30 @@
 
 """Test the placement of two-qubit interactions next to routing SWAPs."""
 
+import contextlib
 import math
 import random
 from unittest.mock import patch
 
-from ddt import ddt, data
+from ddt import ddt, data, unpack
 
-from qiskit.circuit import Gate, Parameter, QuantumCircuit, QuantumRegister
-from qiskit.circuit.library import CU1Gate, RZGate, RZZGate, U1Gate, UnitaryGate, XGate
-from qiskit.circuit.library import QFTGate, qaoa_ansatz
+from qiskit.circuit import Barrier, Gate, Parameter, QuantumCircuit, QuantumRegister
+from qiskit.circuit.library import (
+    CPhaseGate,
+    CU1Gate,
+    CXGate,
+    CZGate,
+    QFTGate,
+    RYGate,
+    RYYGate,
+    RZGate,
+    RZZGate,
+    SwapGate,
+    U1Gate,
+    UnitaryGate,
+    XGate,
+    qaoa_ansatz,
+)
 from qiskit.converters import circuit_to_dag, dag_to_circuit
 from qiskit.dagcircuit import DAGCircuit
 from qiskit.passmanager.flow_controllers import DoWhileController
@@ -50,6 +65,26 @@ def _run(circuit):
     return dag_to_circuit(_AbsorbIntoSwaps().run(circuit_to_dag(circuit)))
 
 
+def _swap_circuit(*between, interaction=None, swap=None):
+    """A SWAP on (0, 1), the ``(operation, qubits)`` pairs ``between``, an interaction on (0, 1)
+    (``cp`` by default) and more two-qubit work on both qubits."""
+    qc = QuantumCircuit(3)
+    qc.append(SwapGate() if swap is None else swap, [0, 1])
+    for operation, qubits in between:
+        qc.append(operation, qubits)
+    qc.append(CPhaseGate(0.3) if interaction is None else interaction, [0, 1])
+    qc.cx(0, 2)
+    qc.cx(1, 2)
+    return qc
+
+
+def _custom_gate(name, definition):
+    """A custom gate called ``name`` with the given ``definition``."""
+    gate = Gate(name, definition.num_qubits, [])
+    gate.definition = definition
+    return gate
+
+
 def _append_standard(circuit, name, qubits):
     """Add a gate from the pass's commutation table, including legacy gate classes."""
     if name in ("cu1", "u1"):
@@ -60,12 +95,14 @@ def _append_standard(circuit, name, qubits):
         getattr(circuit, name)(*arguments, *qubits)
 
 
-def _next_on_both_wires(circuit, index):
-    """Index of the next instruction after ``index`` if it acts on both qubits of ``index``."""
+def _neighbour_on_both_wires(circuit, index, step=1):
+    """Index of the nearest instruction after (or before, for ``step=-1``) ``index`` on its
+    qubits, if that instruction acts on both of them."""
     qubits = set(circuit.data[index].qubits)
-    for later, instruction in enumerate(circuit.data[index + 1 :], start=index + 1):
-        if qubits & set(instruction.qubits):
-            return later if qubits <= set(instruction.qubits) else None
+    stop = len(circuit.data) if step > 0 else -1
+    for other in range(index + step, stop, step):
+        if qubits & set(circuit.data[other].qubits):
+            return other if qubits <= set(circuit.data[other].qubits) else None
     return None
 
 
@@ -89,11 +126,12 @@ def _fold_rzz(angles, _qubits):
     return dag
 
 
-def _line_target(num_qubits, angle_bounded):
-    """A CZ line Target, optionally with a fractional ``rzz`` bounded to ``[0, pi/2]``."""
+def _line_target(num_qubits, angle_bounded=False, two_qubit="cz", t2=None):
+    """A line Target, optionally with a fractional ``rzz`` bounded to ``[0, pi/2]`` and qubit T2s
+    (seconds, ``None`` for unknown)."""
     coupling = CouplingMap.from_line(num_qubits)
     target = Target.from_configuration(
-        ["cz", "rz", "sx", "x"], num_qubits=num_qubits, coupling_map=coupling
+        [two_qubit, "rz", "sx", "x"], num_qubits=num_qubits, coupling_map=coupling
     )
     if angle_bounded:
         target.add_instruction(
@@ -101,7 +139,19 @@ def _line_target(num_qubits, angle_bounded):
             dict.fromkeys(coupling.get_edges()),
             angle_bounds=[(0, math.pi / 2)],
         )
+    if t2 is not None:
+        target.qubit_properties = [QubitProperties(t1=1e-4, t2=value) for value in t2]
     return target
+
+
+def _heavy_hex_backend(backend_class=GenericBackendV2):
+    """A 19-qubit heavy-hex CZ backend."""
+    return backend_class(
+        num_qubits=19,
+        basis_gates=["cz", "rz", "sx", "x"],
+        coupling_map=CouplingMap.from_heavy_hex(3),
+        seed=7,
+    )
 
 
 def _phase_and_cx_circuit(num_qubits=5):
@@ -117,18 +167,36 @@ def _phase_and_cx_circuit(num_qubits=5):
     return qc
 
 
-def _compile_recording_moves(level, target, circuit, seed=7, wrap_in_loop=True):
+def _qft(num_qubits, measure=False):
+    """A ``QFTGate`` circuit, optionally measured."""
+    qc = QuantumCircuit(num_qubits)
+    qc.append(QFTGate(num_qubits), range(num_qubits))
+    if measure:
+        qc.measure_all()
+    return qc
+
+
+def _qaoa(reps):
+    """A bound QAOA ansatz for all-to-all ``ZZ`` terms on 5 qubits."""
+    cost = SparsePauliOp.from_sparse_list(
+        [("ZZ", [i, j], 1.0) for i in range(5) for j in range(i + 1, 5)], num_qubits=5
+    )
+    return qaoa_ansatz(cost, reps=reps).assign_parameters([0.4, 0.9, 0.2, 0.7][: 2 * reps])
+
+
+def _compile(level, circuit, absorb=True, wrap_in_loop=True, **kwargs):
     """Compile with the preset pass manager.
 
-    Return the output, the names of the moved units and the number of level 3 loop iterations
-    (runs of the in-loop two-qubit peephole).  ``wrap_in_loop=False`` removes ``WrapAngles``
-    from the level 3 loop.
+    Return the output, the names of the moved interactions and the number of level 3 loop
+    iterations (runs of the in-loop two-qubit peephole).  ``absorb=False`` makes the pass leave
+    every circuit unchanged, as a control, and ``wrap_in_loop=False`` removes ``WrapAngles`` from
+    the level 3 loop.
     """
     moved = []
     original = _swap_absorption._find_moves
 
-    def recording(dag, *args, **kwargs):
-        order, units, moves = original(dag, *args, **kwargs)
+    def recording(dag, *args, **options):
+        order, units, moves = original(dag, *args, **options)
         moved.extend(order[units[unit][0][0]].name for unit, _, _ in moves)
         return order, units, moves
 
@@ -143,8 +211,13 @@ def _compile_recording_moves(level, target, circuit, seed=7, wrap_in_loop=True):
     with (
         patch.object(_swap_absorption, "_find_moves", recording),
         patch.object(WrapAngles, "DEFAULT_REGISTRY", registry),
+        (
+            contextlib.nullcontext()
+            if absorb
+            else patch.object(_AbsorbIntoSwaps, "run", lambda self, dag: dag)
+        ),
     ):
-        pm = generate_preset_pass_manager(level, target=target, seed_transpiler=seed)
+        pm = generate_preset_pass_manager(level, **kwargs)
         if not wrap_in_loop:
             for controller in pm.optimization._tasks:
                 for task in controller:
@@ -175,26 +248,6 @@ def _translation_absorbs(pm):
     """Whether the translation stage of ``pm`` contains ``_AbsorbIntoSwaps``."""
     tasks = [task for tasks in pm.translation._tasks for task in tasks]
     return any(isinstance(task, _AbsorbIntoSwaps) for task in tasks)
-
-
-def _without_absorption():
-    """Patch ``_AbsorbIntoSwaps`` to leave every circuit unchanged, as a control."""
-    return patch.object(_AbsorbIntoSwaps, "run", lambda self, dag: dag)
-
-
-def _count_moves(level, circuit, **kwargs):
-    """Compile ``circuit`` with the preset pass manager and count the moves the pass makes."""
-    moves = []
-    original = _swap_absorption._find_moves
-
-    def counting(dag, *args):
-        result = original(dag, *args)
-        moves.extend(result[2])
-        return result
-
-    with patch.object(_swap_absorption, "_find_moves", counting):
-        out = generate_preset_pass_manager(level, **kwargs).run(circuit)
-    return out, len(moves)
 
 
 class _MockTranslationPlugin(PassManagerStagePlugin):
@@ -252,17 +305,6 @@ def _tail_circuit(measure=False, other_pair=False, final_barrier=False):
     return qc
 
 
-def _t2_target(num_qubits, t2):
-    """A CZ line Target whose qubits have the T2 times ``t2`` (seconds, ``None`` for unknown)."""
-    target = Target.from_configuration(
-        ["cz", "rz", "sx", "x"],
-        num_qubits=num_qubits,
-        coupling_map=CouplingMap.from_line(num_qubits),
-    )
-    target.qubit_properties = [QubitProperties(t1=1e-4, t2=value) for value in t2]
-    return target
-
-
 @ddt
 class TestAbsorbIntoSwaps(QiskitTestCase):
     """Test the ``_AbsorbIntoSwaps`` pass."""
@@ -301,7 +343,7 @@ class TestAbsorbIntoSwaps(QiskitTestCase):
     @data(None, 0, 1, 2, 3)
     def test_routing_passmanager_optimization_level(self, level):
         """``generate_routing_passmanager`` adds the pass only when given level 2 or 3."""
-        target = _line_target(4, False)
+        target = _line_target(4)
         routing = common.generate_routing_passmanager(
             SabreSwap(target), target, optimization_level=level
         )
@@ -326,12 +368,13 @@ class TestAbsorbIntoSwaps(QiskitTestCase):
         else:
             self.assertNotIn("WrapAngles", names)
 
-    def test_level_three_angle_bounded_moves_controlled_phase(self):
-        """O3 on an angle-bounded Target moves controlled phases, exactly and within bounds."""
-        target = _line_target(5, angle_bounded=True)
+    @data(False, True)
+    def test_level_three_moves_controlled_phase(self, angle_bounded):
+        """O3 moves controlled phases exactly, and within the angle bounds of the Target."""
+        target = _line_target(5, angle_bounded)
         qc = _phase_and_cx_circuit()
         for seed in (3, 7, 11):
-            out, moved, _ = _compile_recording_moves(3, target, qc, seed)
+            out, moved, _ = _compile(3, qc, target=target, seed_transpiler=seed)
             self.assertTrue(set(moved) & {"cp", "cu1", "cs", "csdg"}, moved)
             self.assertTrue(Operator.from_circuit(out).equiv(Operator(qc)))
             self.assertTrue(_rzz_in_bounds(out))
@@ -339,95 +382,60 @@ class TestAbsorbIntoSwaps(QiskitTestCase):
     def test_level_three_angle_bounded_loop_converges(self):
         """With ``WrapAngles`` in the O3 loop, the loop needs fewer iterations than without."""
         target = _line_target(6, angle_bounded=True)
-        qc = QuantumCircuit(6)
-        qc.append(QFTGate(6), range(6))
-        qc = qc.decompose()
+        qc = _qft(6).decompose()
         for seed in (3, 7):
-            out, _, iterations = _compile_recording_moves(3, target, qc, seed)
-            old, _, old_iterations = _compile_recording_moves(
-                3, target, qc, seed, wrap_in_loop=False
+            out, _, iterations = _compile(3, qc, target=target, seed_transpiler=seed)
+            old, _, old_iterations = _compile(
+                3, qc, wrap_in_loop=False, target=target, seed_transpiler=seed
             )
             self.assertLess(iterations, old_iterations)
             for circuit in (out, old):
                 self.assertTrue(Operator.from_circuit(circuit).equiv(Operator(qc)))
                 self.assertTrue(_rzz_in_bounds(circuit))
 
-    def test_level_three_unbounded_absorbs_as_level_two(self):
-        """O3 on a Target without angle bounds moves controlled phases like O2."""
-        target = _line_target(5, angle_bounded=False)
-        qc = _phase_and_cx_circuit()
-        for seed in (3, 7, 11):
-            out, moved, _ = _compile_recording_moves(3, target, qc, seed)
-            self.assertTrue(set(moved) & {"cp", "cu1", "cs", "csdg"}, moved)
-            self.assertTrue(Operator.from_circuit(out).equiv(Operator(qc)))
-
     @data(False, True)
     def test_level_two_ignores_target_properties(self, angle_bounded):
         """O2 output equals that of the pass built without a target, on both Target kinds."""
         target = _line_target(5, angle_bounded)
-        cost = SparsePauliOp.from_sparse_list(
-            [("ZZ", [i, j], 1.0) for i in range(5) for j in range(i + 1, 5)], num_qubits=5
-        )
-        circuits = [
-            _phase_and_cx_circuit(),
-            qaoa_ansatz(cost, reps=2).assign_parameters([0.4, 0.9, 0.2, 0.7]),
-        ]
-        registry = WrapAngleRegistry()
-        registry.add_wrapper("rzz", _fold_rzz)
-        with patch.object(WrapAngles, "DEFAULT_REGISTRY", registry):
-            for qc in circuits:
-                for seed in (1, 2, 3):
-                    out = generate_preset_pass_manager(2, target=target, seed_transpiler=seed).run(
-                        qc
-                    )
-                    with patch.object(
-                        common, "_AbsorbIntoSwaps", lambda target=None: _AbsorbIntoSwaps()
-                    ):
-                        expected = generate_preset_pass_manager(
-                            2, target=target, seed_transpiler=seed
-                        ).run(qc)
-                    self.assertEqual(out, expected)
-                    self.assertEqual(out.layout, expected.layout)
+        for qc in (_phase_and_cx_circuit(), _qaoa(reps=2)):
+            for seed in (1, 2, 3):
+                out = _compile(2, qc, target=target, seed_transpiler=seed)[0]
+                with patch.object(
+                    common, "_AbsorbIntoSwaps", lambda target=None: _AbsorbIntoSwaps()
+                ):
+                    expected = _compile(2, qc, target=target, seed_transpiler=seed)[0]
+                self.assertEqual(out, expected)
+                self.assertEqual(out.layout, expected.layout)
 
-    def test_tail_rule_short_t2_unmeasured(self):
+    @data(
+        ({}, 0),
+        ({"measure": True}, 1),
+        ({"other_pair": True}, 1),
+        ({"final_barrier": True}, 0),
+        ({"final_barrier": True, "measure": True}, 1),
+    )
+    @unpack
+    def test_tail_rule(self, variant, expected):
         """A short-T2 qubit that is unmeasured and ends on one more pair keeps its SWAP alone."""
-        qc = _tail_circuit()
+        qc = _tail_circuit(**variant)
         dag = circuit_to_dag(qc)
         self.assertEqual(len(_find_moves(dag)[2]), 1)
-        self.assertEqual(len(_find_moves(dag, frozenset({1}))[2]), 0)
         self.assertEqual(len(_find_moves(dag, frozenset({2, 3}))[2]), 1)
-        short = _t2_target(4, [100e-6, 8e-6, 100e-6, 100e-6])
-        self.assertEqual(_AbsorbIntoSwaps(target=short).run(circuit_to_dag(qc)), dag)
-        out = dag_to_circuit(_AbsorbIntoSwaps().run(circuit_to_dag(qc)))
-        self.assertNotEqual(out, qc)
-        self.assertEqual(Operator(out), Operator(qc))
-
-    @data("measure", "other_pair")
-    def test_tail_rule_does_not_apply(self, variant):
-        """A measured qubit, or one with work on two more pairs, still gets the move."""
-        qc = _tail_circuit(**{variant: True})
-        dag = circuit_to_dag(qc)
-        self.assertEqual(len(_find_moves(dag, frozenset({1}))[2]), 1)
-        short = _t2_target(4, [100e-6, 8e-6, 100e-6, 100e-6])
-        out = dag_to_circuit(_AbsorbIntoSwaps(target=short).run(dag))
-        self.assertNotEqual(out, qc)
-        if variant == "other_pair":
-            self.assertEqual(Operator(out), Operator(qc))
-
-    def test_tail_rule_barrier_does_not_pin(self):
-        """A final barrier is no measurement and no multi-qubit work for the tail rule."""
-        dag = circuit_to_dag(_tail_circuit(final_barrier=True))
-        self.assertEqual(len(_find_moves(dag, frozenset({1}))[2]), 0)
-        dag = circuit_to_dag(_tail_circuit(final_barrier=True, measure=True))
-        self.assertEqual(len(_find_moves(dag, frozenset({1}))[2]), 1)
+        self.assertEqual(len(_find_moves(dag, frozenset({1}))[2]), expected)
+        short = _line_target(4, t2=[100e-6, 8e-6, 100e-6, 100e-6])
+        for target in (None, short):
+            out = dag_to_circuit(_AbsorbIntoSwaps(target=target).run(circuit_to_dag(qc)))
+            self.assertEqual(out == qc, target is short and expected == 0)
+            if not variant.get("measure"):
+                self.assertEqual(Operator(out), Operator(qc))
 
     def test_short_t2_qubits(self):
         """The tail rule reads the qubit T2 times of the Target."""
         threshold = _swap_absorption._TAIL_T2_THRESHOLD
-        target = _t2_target(4, [threshold / 2, threshold, None, 2 * threshold])
+        target = _line_target(4, t2=[threshold / 2, threshold, None, 2 * threshold])
         self.assertEqual(_short_t2_qubits(target, 4), frozenset({0}))
         self.assertEqual(_short_t2_qubits(target, 0), frozenset())
-        self.assertEqual(_short_t2_qubits(_line_target(4, False), 4), frozenset())
+        self.assertEqual(_short_t2_qubits(_line_target(4), 4), frozenset())
         self.assertEqual(_short_t2_qubits(None, 4), frozenset())
 
     @data(2, 3)
@@ -435,7 +443,7 @@ class TestAbsorbIntoSwaps(QiskitTestCase):
         """The preset pipeline applies the tail rule at O3 only."""
         qc = _tail_circuit()
         for t2, expected in ((8e-6, 0 if level == 3 else 1), (100e-6, 1)):
-            target = _t2_target(4, [100e-6, t2, 100e-6, 100e-6])
+            target = _line_target(4, t2=[100e-6, t2, 100e-6, 100e-6])
             pm = generate_preset_pass_manager(level, target=target, initial_layout=[0, 1, 2, 3])
             absorb = _routing_absorb(pm)
             moves = _find_moves(circuit_to_dag(qc), _short_t2_qubits(absorb.target, 4))[2]
@@ -487,6 +495,128 @@ class TestAbsorbIntoSwaps(QiskitTestCase):
                         self.assertEqual(len(_find_moves(circuit_to_dag(qc))[2]), 1)
                         self.assertTrue(Operator(_run(qc)).equiv(Operator(qc)))
 
+    def test_moves_next_to_swap(self):
+        """An interaction reaches its SWAP through gates it commutes with, exactly."""
+        cp_circuit = QuantumCircuit(3)
+        cp_circuit.h(0)
+        cp_circuit.compose(
+            _swap_circuit((RZGate(0.2), [0]), (CZGate(), [0, 2]), (RZZGate(0.4), [1, 2])),
+            inplace=True,
+        )
+        earlier = QuantumCircuit(3)
+        earlier.cp(0.3, 0, 1)
+        earlier.cz(0, 2)
+        earlier.swap(0, 1)
+        earlier.cx(0, 2)
+        earlier.cx(1, 2)
+        unitary = QuantumCircuit(3)
+        unitary.swap(0, 1)
+        unitary.p(0.1, 1)
+        unitary.cp(0.5, 1, 2)
+        unitary.append(UnitaryGate(Operator.from_label("ZZ").to_matrix() * 1j), [0, 1])
+        unitary.cx(0, 2)
+        unitary.cx(2, 1)
+        cx_circuit = QuantumCircuit(4)
+        cx_circuit.h([0, 1])
+        cx_circuit.swap(0, 1)
+        cx_circuit.rz(0.2, 0)
+        cx_circuit.cx(0, 2)
+        cx_circuit.sx(1)
+        cx_circuit.cx(3, 1)
+        cx_circuit.cx(0, 1)
+        cx_circuit.cx(0, 2)
+        cx_circuit.cx(1, 3)
+        zz_after = QuantumCircuit(3)
+        zz_after.h([0, 1, 2])
+        zz_after.swap(0, 1)
+        zz_after.cz(1, 2)
+        zz_after.cx(0, 1)
+        zz_after.rz(0.7, 1)
+        zz_after.cx(0, 1)
+        zz_after.h(0)
+        zz_after.cx(0, 2)
+        zz_after.cx(1, 2)
+        zz_shared = QuantumCircuit(3)
+        zz_shared.swap(0, 1)
+        zz_shared.cx(0, 2)
+        zz_shared.cx(0, 1)
+        zz_shared.rz(0.7, 1)
+        zz_shared.cx(0, 1)
+        zz_shared.cx(1, 2)
+        zz_shared.cx(0, 2)
+        cases = {
+            "cp through diagonal gates": (cp_circuit, "cp", 1),
+            "earlier term delayed onto the swap": (earlier, "cp", -1),
+            "diagonal UnitaryGate": (unitary, "unitary", 1),
+            "cx through diagonal control and X-like target": (cx_circuit, "cx", 1),
+            "ryy through Y rotations": (
+                _swap_circuit((RYGate(0.3), [0]), (RYYGate(0.2), [1, 2]), interaction=RYYGate(0.5)),
+                "ryy",
+                1,
+            ),
+            "cx rz cx block after the swap": (zz_after, "cx", 1),
+            "cx rz cx block through a shared control": (zz_shared, "cx", 1),
+        }
+        for name, (qc, moved, step) in cases.items():
+            with self.subTest(name):
+                out = _run(qc)
+                self.assertEqual(Operator(out), Operator(qc))
+                swap = [inst.name for inst in out.data].index("swap")
+                self.assertEqual(out.data[_neighbour_on_both_wires(out, swap, step)].name, moved)
+
+    def test_blocked_moves_leave_circuit_unchanged(self):
+        """No move crosses an operation that blocks it, and lookalike gates are not moved."""
+        one, two = QuantumCircuit(1), QuantumCircuit(2)
+        one.h(0)
+        two.h(0)
+        cx_definition = QuantumCircuit(2)
+        cx_definition.cx(0, 1)
+        nearly_zz = UnitaryGate(Operator.from_label("ZZ")).to_matrix()
+        nearly_zz[0, 1] = nearly_zz[1, 0] = 1e-13
+        control_flow = QuantumCircuit(3, 1)
+        control_flow.swap(0, 1)
+        with control_flow.if_test((control_flow.clbits[0], 1)):
+            control_flow.rz(0.2, 0)
+        control_flow.cp(0.3, 0, 1)
+        control_flow.cx(0, 2)
+        control_flow.cx(1, 2)
+        wire_end = QuantumCircuit(3)
+        wire_end.cp(0.3, 0, 1)
+        wire_end.cz(0, 2)
+        wire_end.swap(0, 1)
+        wire_end.cx(0, 2)
+        wire_end.h(1)
+        non_commuting = QuantumCircuit(2)
+        non_commuting.cp(0.3, 0, 1)
+        non_commuting.h(0)
+        non_commuting.swap(0, 1)
+        non_commuting.measure_all()
+        adjacent = QuantumCircuit(3)
+        adjacent.cz(0, 1)
+        adjacent.compose(_swap_circuit((RZGate(0.2), [0])), inplace=True)
+        cases = {
+            "control flow": control_flow,
+            "barrier": _swap_circuit((Barrier(2), [0, 1])),
+            "swap ending a wire": wire_end,
+            "non-commuting gate": non_commuting,
+            "swap already next to a term": adjacent,
+            "cx after a gate diagonal on its target": _swap_circuit(
+                (RZGate(0.2), [1]), interaction=CXGate()
+            ),
+            "custom gate named swap": _swap_circuit(
+                (RZGate(0.2), [0]), swap=_custom_gate("swap", cx_definition)
+            ),
+            "nearly diagonal UnitaryGate": _swap_circuit(
+                (UnitaryGate(nearly_zz, check_input=False), [0, 2])
+            ),
+        }
+        for name in ("cp", "cx", "unitary"):
+            cases[f"custom gate named {name}"] = _swap_circuit((_custom_gate(name, two), [0, 2]))
+        cases["custom gate named rz"] = _swap_circuit((_custom_gate("rz", one), [0]))
+        for name, qc in cases.items():
+            with self.subTest(name):
+                self.assertEqual(_run(qc), qc)
+
     def test_two_overlapping_moves(self):
         """Two CP moves may share one qubit across their SWAP pairs."""
         qc = QuantumCircuit(4)
@@ -525,41 +655,44 @@ class TestAbsorbIntoSwaps(QiskitTestCase):
     def test_symbolic_controlled_phase(self):
         """The pass moves symbolic CP without changing its parameter or bound operator."""
         theta = Parameter("theta")
-        qc = QuantumCircuit(3)
-        qc.swap(0, 1)
-        qc.rz(0.2, 0)
-        qc.cp(theta, 0, 1)
-        qc.cx(0, 2)
-        qc.cx(1, 2)
+        qc = _swap_circuit((RZGate(0.2), [0]), interaction=CPhaseGate(theta))
         out = _run(qc)
+        self.assertNotEqual(out, qc)
         self.assertEqual(out.parameters, qc.parameters)
         self.assertTrue(
             Operator(out.assign_parameters({theta: 0.37})).equiv(
                 Operator(qc.assign_parameters({theta: 0.37}))
             )
         )
-        self.assertNotEqual(out, qc)
 
-    def test_control_flow_blocks_move(self):
-        """An if/else boundary is never crossed by the CP candidate."""
-        qc = QuantumCircuit(3, 1)
-        qc.swap(0, 1)
-        with qc.if_test((qc.clbits[0], 1)):
+    def test_asymmetric_crz_is_not_moved_across_swap(self):
+        """A ``crz`` (which does not commute with SWAP) is moved up to a SWAP, never through one."""
+        for control, target in ((0, 1), (1, 0)):
+            qc = QuantumCircuit(3)
+            qc.h([0, 1])
+            qc.swap(0, 1)
             qc.rz(0.2, 0)
-        qc.cp(0.3, 0, 1)
-        qc.cx(0, 2)
-        qc.cx(1, 2)
-        self.assertEqual(_run(qc), qc)
+            qc.crz(0.7, control, target)
+            qc.swap(0, 1)
+            qc.crz(0.5, target, control)
+            qc.cx(0, 2)
+            qc.cx(1, 2)
+            out = _run(qc)
+            self.assertEqual(Operator(out), Operator(qc))
+            self.assertEqual([inst.name for inst in out.data].count("swap"), 2)
 
-    def test_barrier_blocks_move(self):
-        """A barrier between SWAP and CP prevents absorption."""
-        qc = QuantumCircuit(3)
+    def test_each_term_absorbed_once(self):
+        """Two SWAPs never claim the same diagonal term."""
+        qc = QuantumCircuit(2)
         qc.swap(0, 1)
-        qc.barrier(0, 1)
+        qc.rz(0.1, 0)
         qc.cp(0.3, 0, 1)
-        qc.cx(0, 2)
-        qc.cx(1, 2)
-        self.assertEqual(_run(qc), qc)
+        qc.rz(0.2, 1)
+        qc.swap(0, 1)
+        qc.cx(0, 1)
+        out = _run(qc)
+        self.assertEqual(Operator(out), Operator(qc))
+        self.assertEqual(out.count_ops(), qc.count_ops())
 
     def test_random_small_circuit_operators(self):
         """Sample interacting gates after seeded CX and CP move opportunities."""
@@ -594,340 +727,89 @@ class TestAbsorbIntoSwaps(QiskitTestCase):
             self.assertTrue(Operator(_run(qc)).equiv(Operator(qc)))
         self.assertGreater(selected, 0)
 
-    def test_moves_controlled_phase_to_swap(self):
-        """A later controlled phase reaches the SWAP through commuting diagonal gates."""
-        qc = QuantumCircuit(3)
-        qc.h(0)
-        qc.swap(0, 1)
-        qc.rz(0.2, 0)
-        qc.cz(0, 2)
-        qc.rzz(0.4, 1, 2)
-        qc.cp(0.3, 0, 1)
-        qc.cx(0, 2)
-        qc.cx(1, 2)
-        out = _run(qc)
-        self.assertEqual(Operator(out), Operator(qc))
-        swap_index = [inst.name for inst in out.data].index("swap")
-        self.assertEqual(out.data[_next_on_both_wires(out, swap_index)].name, "cp")
-
-    def test_asymmetric_crz_is_not_moved_across_swap(self):
-        """A ``crz`` (which does not commute with SWAP) is moved up to a SWAP, never through one."""
-        for control, target in ((0, 1), (1, 0)):
-            qc = QuantumCircuit(3)
-            qc.h([0, 1])
-            qc.swap(0, 1)
-            qc.rz(0.2, 0)
-            qc.crz(0.7, control, target)
-            qc.swap(0, 1)
-            qc.crz(0.5, target, control)
-            qc.cx(0, 2)
-            qc.cx(1, 2)
-            out = _run(qc)
-            self.assertEqual(Operator(out), Operator(qc))
-            self.assertEqual([inst.name for inst in out.data].count("swap"), 2)
-
-    def test_moves_earlier_term_onto_swap(self):
-        """An earlier diagonal term is delayed onto the SWAP when no later one is available."""
-        qc = QuantumCircuit(3)
-        qc.cp(0.3, 0, 1)
-        qc.cz(0, 2)
-        qc.swap(0, 1)
-        qc.cx(0, 2)
-        qc.cx(1, 2)
-        out = _run(qc)
-        self.assertEqual(Operator(out), Operator(qc))
-        self.assertEqual([inst.name for inst in out.data[:3]], ["cz", "cp", "swap"])
-
-    def test_moves_zz_block_after_swap(self):
-        """A ``cx rz cx`` block after the SWAP is moved back onto it."""
-        qc = QuantumCircuit(3)
-        qc.h([0, 1, 2])
-        qc.swap(0, 1)
-        qc.cz(1, 2)
-        qc.cx(0, 1)
-        qc.rz(0.7, 1)
-        qc.cx(0, 1)
-        qc.h(0)
-        qc.cx(0, 2)
-        qc.cx(1, 2)
-        out = _run(qc)
-        self.assertEqual(Operator(out), Operator(qc))
-        swap_index = [inst.name for inst in out.data].index("swap")
-        self.assertEqual(out.data[swap_index + 1].name, "cx")
-        self.assertEqual(_next_on_both_wires(out, swap_index), swap_index + 1)
-
-    def test_diagonal_unitary_block(self):
-        """A diagonal two-qubit ``UnitaryGate`` counts as a diagonal interaction."""
-        qc = QuantumCircuit(3)
-        qc.swap(0, 1)
-        qc.p(0.1, 1)
-        qc.cp(0.5, 1, 2)
-        qc.append(UnitaryGate(Operator.from_label("ZZ").to_matrix() * 1j), [0, 1])
-        qc.cx(0, 2)
-        qc.cx(2, 1)
-        out = _run(qc)
-        self.assertEqual(Operator(out), Operator(qc))
-        swap_index = [inst.name for inst in out.data].index("swap")
-        self.assertEqual(out.data[_next_on_both_wires(out, swap_index)].name, "unitary")
-
-    def test_swap_ending_a_wire_untouched(self):
-        """A SWAP after which one of its qubits does no more multi-qubit work is left alone."""
-        qc = QuantumCircuit(3)
-        qc.cp(0.3, 0, 1)
-        qc.cz(0, 2)
-        qc.swap(0, 1)
-        qc.cx(0, 2)
-        qc.h(1)
-        self.assertEqual(_run(qc), qc)
-
-    def test_non_commuting_gate_blocks(self):
-        """Nothing moves across an operation it does not commute with."""
-        qc = QuantumCircuit(2)
-        qc.cp(0.3, 0, 1)
-        qc.h(0)
-        qc.swap(0, 1)
-        qc.measure_all()
-        self.assertEqual(_run(qc), qc)
-
-    def test_adjacent_pair_untouched(self):
-        """A SWAP that already touches a diagonal term of its pair is left as it is."""
-        qc = QuantumCircuit(3)
-        qc.cz(0, 1)
-        qc.swap(0, 1)
-        qc.rz(0.2, 0)
-        qc.cp(0.3, 0, 1)
-        qc.cx(0, 2)
-        qc.cx(1, 2)
-        self.assertEqual(_run(qc), qc)
-
-    def test_each_term_absorbed_once(self):
-        """Two SWAPs never claim the same diagonal term."""
-        qc = QuantumCircuit(2)
-        qc.swap(0, 1)
-        qc.rz(0.1, 0)
-        qc.cp(0.3, 0, 1)
-        qc.rz(0.2, 1)
-        qc.swap(0, 1)
-        qc.cx(0, 1)
-        out = _run(qc)
-        self.assertEqual(Operator(out), Operator(qc))
-        self.assertEqual(out.count_ops(), qc.count_ops())
-
-    def test_moves_cx_through_commuting_gates(self):
-        """A CX reaches the SWAP through gates diagonal on its control and X-like on its target."""
-        qc = QuantumCircuit(4)
-        qc.h([0, 1])
-        qc.swap(0, 1)
-        qc.rz(0.2, 0)
-        qc.cx(0, 2)
-        qc.sx(1)
-        qc.cx(3, 1)
-        qc.cx(0, 1)
-        qc.cx(0, 2)
-        qc.cx(1, 3)
-        out = _run(qc)
-        self.assertEqual(Operator(out), Operator(qc))
-        swap_index = [inst.name for inst in out.data].index("swap")
-        self.assertEqual(out.data[swap_index + 1].name, "cx")
-        self.assertEqual(_next_on_both_wires(out, swap_index), swap_index + 1)
-
-    def test_moves_ryy_through_y_rotations(self):
-        """An ``ryy`` passes gates that commute with ``Y`` on the shared qubits."""
-        qc = QuantumCircuit(3)
-        qc.swap(0, 1)
-        qc.ry(0.3, 0)
-        qc.ryy(0.2, 1, 2)
-        qc.ryy(0.5, 0, 1)
-        qc.cx(0, 2)
-        qc.cx(1, 2)
-        out = _run(qc)
-        self.assertEqual(Operator(out), Operator(qc))
-        self.assertEqual([inst.name for inst in out.data[:2]], ["swap", "ryy"])
-        self.assertEqual(_next_on_both_wires(out, 0), 1)
-
-    def test_reversed_cx_blocks(self):
-        """A CX is not moved across a gate that is diagonal on its target qubit."""
-        qc = QuantumCircuit(3)
-        qc.swap(0, 1)
-        qc.rz(0.2, 1)
-        qc.cx(0, 1)
-        qc.cx(0, 2)
-        qc.cx(1, 2)
-        self.assertEqual(_run(qc), qc)
-
-    def test_moves_zz_block_through_shared_control(self):
-        """A ``cx rz cx`` block passes a CX whose control is on a shared qubit."""
-        qc = QuantumCircuit(3)
-        qc.swap(0, 1)
-        qc.cx(0, 2)
-        qc.cx(0, 1)
-        qc.rz(0.7, 1)
-        qc.cx(0, 1)
-        qc.cx(1, 2)
-        qc.cx(0, 2)
-        out = _run(qc)
-        self.assertEqual(Operator(out), Operator(qc))
-        self.assertEqual([inst.name for inst in out.data[:4]], ["swap", "cx", "rz", "cx"])
-
-    @data("cp", "cx", "rz", "unitary")
-    def test_custom_gate_with_standard_name_blocks(self, name):
-        """A custom gate that reuses a standard name is not treated as the standard gate."""
-        custom = QuantumCircuit(2 if name != "rz" else 1)
-        custom.h(0)
-        gate = Gate(name, custom.num_qubits, [])
-        gate.definition = custom
-        qc = QuantumCircuit(3)
-        qc.swap(0, 1)
-        qc.append(gate, [0] if name == "rz" else [0, 2])
-        qc.cp(0.3, 0, 1)
-        qc.cx(0, 2)
-        qc.cx(1, 2)
-        self.assertEqual(_run(qc), qc)
-
-    def test_custom_swap_is_not_a_swap(self):
-        """A custom gate named ``swap`` is not a routing SWAP."""
-        definition = QuantumCircuit(2)
-        definition.cx(0, 1)
-        gate = Gate("swap", 2, [])
-        gate.definition = definition
-        qc = QuantumCircuit(3)
-        qc.append(gate, [0, 1])
-        qc.rz(0.2, 0)
-        qc.cp(0.3, 0, 1)
-        qc.cx(0, 2)
-        qc.cx(1, 2)
-        self.assertEqual(_run(qc), qc)
-
-    def test_nearly_diagonal_unitary_blocks(self):
-        """A ``UnitaryGate`` with any nonzero off-diagonal entry is not diagonal."""
-        matrix = UnitaryGate(Operator.from_label("ZZ")).to_matrix()
-        matrix[0, 1] = matrix[1, 0] = 1e-13
-        qc = QuantumCircuit(3)
-        qc.swap(0, 1)
-        qc.append(UnitaryGate(matrix, check_input=False), [0, 2])
-        qc.cp(0.3, 0, 1)
-        qc.cx(0, 2)
-        qc.cx(1, 2)
-        self.assertEqual(_run(qc), qc)
-
     @data(2, 3)
-    def test_preset_custom_cx_exact(self, level):
-        """A custom gate named ``cx`` next to routing SWAPs compiles exactly at O2 and O3."""
+    def test_preset_exact(self, level):
+        """A custom gate named ``cx`` and routed ``crz`` in both directions compile exactly."""
         definition = QuantumCircuit(2)
         definition.cx(1, 0)
         definition.ry(0.3, 0)
-        gate = Gate("cx", 2, [])
-        gate.definition = definition
-        qc = QuantumCircuit(4)
-        qc.h(range(4))
+        custom_cx = _custom_gate("cx", definition)
+        cx_circuit = QuantumCircuit(4)
+        cx_circuit.h(range(4))
         for i in range(4):
             for j in range(i + 1, 4):
-                qc.cp(0.2 * (i + j), i, j)
-                qc.append(gate, [j, i])
-        target = Target.from_configuration(
-            ["cx", "rz", "sx", "x"], num_qubits=4, coupling_map=CouplingMap.from_line(4)
-        )
-        out = generate_preset_pass_manager(level, target=target, seed_transpiler=7).run(qc)
-        self.assertTrue(Operator.from_circuit(out).equiv(Operator(qc)))
-
-    @data(2, 3)
-    def test_preset_crz_through_swaps_exact(self, level):
-        """Routed controlled-RZ interactions in both directions compile exactly at O2 and O3."""
-        qc = QuantumCircuit(4)
-        qc.h(range(4))
+                cx_circuit.cp(0.2 * (i + j), i, j)
+                cx_circuit.append(custom_cx, [j, i])
+        crz_circuit = QuantumCircuit(4)
+        crz_circuit.h(range(4))
         for i in range(4):
             for j in range(4):
                 if i != j:
-                    qc.crz(0.1 * (i + 2 * j + 1), i, j)
-        target = Target.from_configuration(
-            ["cz", "rz", "sx", "x"], num_qubits=4, coupling_map=CouplingMap.from_line(4)
-        )
-        out = generate_preset_pass_manager(level, target=target, seed_transpiler=3).run(qc)
-        self.assertTrue(Operator.from_circuit(out).equiv(Operator(qc)))
+                    crz_circuit.crz(0.1 * (i + 2 * j + 1), i, j)
+        for qc, two_qubit, seed in ((cx_circuit, "cx", 7), (crz_circuit, "cz", 3)):
+            with self.subTest(two_qubit=two_qubit):
+                target = _line_target(4, two_qubit=two_qubit)
+                out = generate_preset_pass_manager(level, target=target, seed_transpiler=seed).run(
+                    qc
+                )
+                self.assertTrue(Operator.from_circuit(out).equiv(Operator(qc)))
 
     def test_preset_pass_manager_qaoa(self):
         """Routed QAOA on a line needs fewer two-qubit gates, and stays equivalent."""
-        cost = SparsePauliOp.from_sparse_list(
-            [("ZZ", [i, j], 1.0) for i in range(5) for j in range(i + 1, 5)], num_qubits=5
-        )
-        qc = qaoa_ansatz(cost, reps=1).assign_parameters([0.4, 0.9])
-        target = Target.from_configuration(
-            ["cz", "rz", "sx", "x"], num_qubits=5, coupling_map=CouplingMap.from_line(5)
-        )
-        out = generate_preset_pass_manager(2, target=target, seed_transpiler=7).run(qc)
+        qc = _qaoa(reps=1)
+        target = _line_target(5)
+        out = _compile(2, qc, target=target, seed_transpiler=7)[0]
         self.assertEqual(Operator.from_circuit(out), Operator(qc))
-        with _without_absorption():
-            without = generate_preset_pass_manager(2, target=target, seed_transpiler=7).run(qc)
+        without = _compile(2, qc, absorb=False, target=target, seed_transpiler=7)[0]
         self.assertLess(out.count_ops()["cz"], without.count_ops()["cz"])
 
     def test_level_two_layout_unchanged(self):
         """At O2 the pass runs after VF2PostLayout, so the layout equals that of the control."""
-        backend = GenericBackendV2(
-            num_qubits=19,
-            basis_gates=["cz", "rz", "sx", "x"],
-            coupling_map=CouplingMap.from_heavy_hex(3),
-            seed=7,
-        )
-        qft = QuantumCircuit(8)
-        qft.append(QFTGate(8), range(8))
-        qft.measure_all()
-        for qc in (qft, _phase_and_cx_circuit(6)):
+        backend = _heavy_hex_backend()
+        for qc in (_qft(8, measure=True), _phase_and_cx_circuit(6)):
             for seed in (1, 2, 3):
-                out, moves = _count_moves(2, qc, backend=backend, seed_transpiler=seed)
-                self.assertGreater(moves, 0)
-                with _without_absorption():
-                    control = generate_preset_pass_manager(
-                        2, backend=backend, seed_transpiler=seed
-                    ).run(qc)
+                out, moved, _ = _compile(2, qc, backend=backend, seed_transpiler=seed)
+                self.assertGreater(len(moved), 0)
+                control = _compile(2, qc, absorb=False, backend=backend, seed_transpiler=seed)[0]
                 self.assertNotEqual(out, control)
                 self.assertEqual(out.layout, control.layout)
 
     def test_level_three_initial_layout_kept(self):
         """At O3 with an ``initial_layout`` the layout equals that of the control."""
-        target = _line_target(6, angle_bounded=False)
+        target = _line_target(6)
         qc = _phase_and_cx_circuit(6)
         initial_layout = [5, 3, 1, 0, 2, 4]
         for seed in (1, 2, 3):
             kwargs = {"target": target, "initial_layout": initial_layout, "seed_transpiler": seed}
-            out, moves = _count_moves(3, qc, **kwargs)
-            self.assertGreater(moves, 0)
-            with _without_absorption():
-                control = generate_preset_pass_manager(3, **kwargs).run(qc)
+            out, moved, _ = _compile(3, qc, **kwargs)
+            self.assertGreater(len(moved), 0)
+            control = _compile(3, qc, absorb=False, **kwargs)[0]
             self.assertEqual(out.layout, control.layout)
             self.assertEqual(out.layout.initial_index_layout()[:6], initial_layout)
             self.assertTrue(Operator.from_circuit(out).equiv(Operator(qc)))
 
     def test_level_three_default_layout_equivalent(self):
         """At O3 the final VF2PostLayout can choose another layout, so only check equivalence."""
-        target = _line_target(6, angle_bounded=False)
-        qc = QuantumCircuit(6)
-        qc.append(QFTGate(6), range(6))
+        target = _line_target(6)
+        qc = _qft(6)
         for seed in (1, 2, 3):
-            out, moves = _count_moves(3, qc, target=target, seed_transpiler=seed)
-            self.assertGreater(moves, 0)
+            out, moved, _ = _compile(3, qc, target=target, seed_transpiler=seed)
+            self.assertGreater(len(moved), 0)
             self.assertTrue(Operator.from_circuit(out).equiv(Operator(qc)))
 
     @data(2, 3)
     def test_provider_translation_plugin(self, level):
         """A backend's own translation plugin gives the same output as the default plugin."""
-        kwargs = {
-            "num_qubits": 19,
-            "basis_gates": ["cz", "rz", "sx", "x"],
-            "coupling_map": CouplingMap.from_heavy_hex(3),
-            "seed": 7,
-        }
-        qc = QuantumCircuit(8)
-        qc.append(QFTGate(8), range(8))
-        qc.measure_all()
+        qc = _qft(8, measure=True)
         with _with_mock_translation_plugin():
-            backend = _ProviderPluginBackend(**kwargs)
+            backend = _heavy_hex_backend(_ProviderPluginBackend)
             pm = generate_preset_pass_manager(level, backend=backend, seed_transpiler=1)
             self.assertFalse(_translation_absorbs(pm))
             self.assertIsInstance(_routing_absorb(pm), _AbsorbIntoSwaps)
-            out, moves = _count_moves(level, qc, backend=backend, seed_transpiler=1)
-        self.assertGreater(moves, 0)
-        expected, default_moves = _count_moves(
-            level, qc, backend=GenericBackendV2(**kwargs), seed_transpiler=1
+            out, moved, _ = _compile(level, qc, backend=backend, seed_transpiler=1)
+        self.assertGreater(len(moved), 0)
+        expected, default_moved, _ = _compile(
+            level, qc, backend=_heavy_hex_backend(), seed_transpiler=1
         )
-        self.assertEqual(moves, default_moves)
+        self.assertEqual(moved, default_moved)
         self.assertEqual(out, expected)
