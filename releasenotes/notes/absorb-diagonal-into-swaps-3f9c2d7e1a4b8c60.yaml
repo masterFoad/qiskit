@@ -1,0 +1,56 @@
+---
+features_transpiler:
+  - |
+    The translation stage of the preset pass managers at ``optimization_level`` 2 and 3 now
+    starts by moving a two-qubit interaction on the qubit pair of a ``swap`` present after
+    routing, for example
+    ``cx``, ``cz``, ``rzz``, ``rxx``, a diagonal two-qubit :class:`.UnitaryGate`, or a
+    ``cx``-``rz``-``cx`` block, so that it sits directly next to that ``swap`` when it commutes
+    with every operation in between on those two qubits.  Commutation is decided exactly from the
+    single-qubit Pauli that each standard gate commutes with on each of its qubits (for example
+    ``cx`` commutes with ``Z`` on its control and ``X`` on its target): two operations that commute
+    with the same Pauli on every qubit they share commute with each other.  An interaction is never
+    moved across a ``swap``, and only Qiskit's standard gates and :class:`.UnitaryGate` are
+    recognized, so a custom gate that reuses a standard name is left in place.  The two-qubit
+    peephole optimization then synthesizes the ``swap`` and the interaction together as a single
+    block, for example two two-qubit gates instead of four for a ``swap`` followed by a ``cx``, or
+    three instead of five for a controlled phase (``cp``, ``cu1``, ``cs``, ``csdg``).
+    Placement and the SWAPs chosen by the router are unchanged. The nearest later interaction is
+    preferred; otherwise the nearest earlier one is used. A SWAP after which one of its qubits
+    does no further multi-qubit work is left alone.  At level 3, a SWAP is also left alone when
+    one of its qubits has a :class:`.Target` T2 below 10 microseconds, is not measured
+    afterwards, and all its remaining multi-qubit operations act on the same set of qubits (for
+    example one other qubit pair): the level 3 loop
+    can then leave single-qubit gates after that qubit's last two-qubit gate, which an
+    as-late-as-possible schedule parks at the end of the circuit.
+
+    The design is motivated by the optimization-aware SWAP cost of Liu, Li and Zhou,
+    `"Not All SWAPs Have the Same Cost: A Case for Optimization-Aware Qubit Routing"
+    <https://arxiv.org/abs/2205.10596>`__ (HPCA 2022), and the dressed-SWAP synthesis of Lao and
+    Browne, `"2QAN: A quantum compiler for 2-local qubit Hamiltonian simulation algorithms"
+    <https://arxiv.org/abs/2108.02099>`__ (ISCA 2022).  This pass applies a restricted
+    commutation rule after routing.  Some routed circuits with many commuting interactions, such as
+    selected QAOA circuits, can need fewer two-qubit gates and have lower two-qubit depth.
+    Total depth can rise where merged blocks need more single-qubit gates.
+  - |
+    The same step can also move a run of single-qubit gates that sits between a ``swap`` and an
+    interaction across the ``swap`` onto the opposite qubit, using the exact identity
+    :math:`\mathrm{SWAP}\,(g \otimes I) = (I \otimes g)\,\mathrm{SWAP}`, so that the
+    interaction can then be placed next to the ``swap``.  A run of ``cz`` gates may be moved as a
+    whole, in its original order, when every gate in it commutes with each operation it crosses.
+    An interaction is not moved out of a run of two-qubit gates on the same qubit pair, since the
+    peephole optimization would already synthesize that run as one block.
+  - |
+    Added a new argument ``optimization_level`` to :func:`.generate_translation_passmanager`.
+    When it is 2 or 3, the generated translation stage starts with the step that moves two-qubit
+    interactions next to ``swap`` gates.  When it is ``None`` (the default), the translation stage
+    is unchanged.  The built-in ``translator`` and ``synthesis`` translation stage plugins pass
+    their optimization level.  A translation stage plugin that builds its stage with
+    :func:`.generate_translation_passmanager` can pass its ``optimization_level`` to include this
+    step.
+upgrade_transpiler:
+  - |
+    On rare inputs the two-qubit count at ``optimization_level`` 2 and 3 can increase slightly,
+    because later passes see a different circuit.  Translation stage plugins that do not pass
+    ``optimization_level`` to :func:`.generate_translation_passmanager` do not run the step that
+    moves two-qubit interactions next to ``swap`` gates.
