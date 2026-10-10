@@ -35,7 +35,6 @@ from qiskit.transpiler.passes import ElidePermutations
 from qiskit.transpiler.passes import RemoveDiagonalGatesBeforeMeasure
 from qiskit.transpiler.passes import CommutativeOptimization
 from qiskit.transpiler.passes import TwoQubitPeepholeOptimization
-from qiskit.transpiler.passes import WrapAngles
 from qiskit.transpiler.passes import BasisTranslator
 from qiskit.transpiler.passes import SynthesizeRZRotations
 from qiskit.transpiler.passes import OptimizeCliffordT
@@ -586,16 +585,6 @@ class OptimizationPassManager(PassManagerStagePlugin):
                         pass_manager_config.target,
                         approximation_degree=pass_manager_config.approximation_degree,
                     ),
-                ]
-                if (
-                    pass_manager_config.target is not None
-                    and pass_manager_config.target.has_angle_bounds()
-                ):
-                    # The peephole can synthesize angles outside the Target's bounds.  Without
-                    # wrapping them here, the basis check below fails in every iteration, the
-                    # whole translation stage re-runs and the loop never reaches a fixed point.
-                    loop.append(WrapAngles(pass_manager_config.target))
-                loop += [
                     RemoveIdentityEquivalent(
                         approximation_degree=pass_manager_config.approximation_degree,
                         target=pass_manager_config.target,

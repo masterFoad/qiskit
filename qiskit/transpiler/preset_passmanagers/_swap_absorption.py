@@ -12,6 +12,8 @@
 
 """Move two-qubit interactions next to SWAPs present after routing on the same pair."""
 
+from __future__ import annotations
+
 import numpy as np
 
 from qiskit.circuit import Gate, Qubit
@@ -333,7 +335,9 @@ def _find_moves(dag, short_t2=frozenset()):
                 and unit not in taken
                 and all(commutes_between(q, unit, swap, len(runs[q])) for q in pair)
             ):
-                if hop and has_same_pair_block(unit, step):
+                # The same-pair-run guard applies to every move, not only to hops: a unit is not
+                # pulled out of a run the peephole already merges (a CZ-only run may move whole).
+                if has_same_pair_block(unit, step):
                     unit = donor_block(unit, swap, step, runs)
                     if unit is None:
                         return None
@@ -346,22 +350,25 @@ def _find_moves(dag, short_t2=frozenset()):
         return None
 
     moves = []
+    hopped = set()
+
+    def record(move):
+        taken.add(move[0])
+        hopped.update(move[3])
+        moves.append(move)
+        destinations[move[0]] = move[1]
+        # A whole-block donor keeps its original units out of any later move.
+        taken.update(compound_sources.get(move[0], ()))
+        for original in compound_sources.get(move[0], ()):
+            destinations[original] = move[1]
+
     for swap in pending:
         if (move := search(swap, False)) is not None:
-            taken.add(move[0])
-            moves.append(move)
-            destinations[move[0]] = move[1]
-    hopped = set()
+            record(move)
     moved = {move[1] for move in moves}
     for swap in pending:
         if swap not in moved and (move := search(swap, True)) is not None:
-            taken.add(move[0])
-            hopped.update(move[3])
-            moves.append(move)
-            destinations[move[0]] = move[1]
-            taken.update(compound_sources.get(move[0], ()))
-            for original in compound_sources.get(move[0], ()):
-                destinations[original] = move[1]
+            record(move)
     return order, units, moves
 
 
