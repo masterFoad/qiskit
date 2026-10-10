@@ -51,6 +51,7 @@ from qiskit.transpiler.passes import VF2PostLayout
 from qiskit.transpiler.passes.layout.vf2_layout import VF2LayoutStopReason
 from qiskit.transpiler.passes.layout.vf2_post_layout import VF2PostLayoutStopReason
 from qiskit.transpiler.passes import WrapAngles
+from qiskit.transpiler.preset_passmanagers._swap_absorption import _AbsorbIntoSwaps
 from qiskit.transpiler.exceptions import TranspilerError
 from qiskit.transpiler.layout import Layout
 from qiskit.transpiler.optimization_metric import OptimizationMetric
@@ -448,6 +449,7 @@ def generate_translation_passmanager(
     unitary_synthesis_plugin_config: dict | None = None,
     hls_config: HLSConfig | None = None,
     qubits_initially_zero: bool = True,
+    optimization_level: int | None = None,
 ):
     """Generate a basis translation :class:`~qiskit.transpiler.PassManager`
 
@@ -476,6 +478,11 @@ def generate_translation_passmanager(
             Specifies how to synthesize various high-level objects.
         qubits_initially_zero: Indicates whether the input circuit is
             zero-initialized.
+        optimization_level: The optimization level of the preset pass manager this
+            translation stage is built for. At levels 2 and 3, the stage starts by moving
+            two-qubit interactions next to the ``swap`` gates on the same qubit pair, so that
+            the optimization stage can synthesize each ``swap`` and interaction as one block.
+            If ``None`` (the default), this step is not added.
 
     Returns:
         PassManager: The basis translation pass manager
@@ -483,8 +490,13 @@ def generate_translation_passmanager(
     Raises:
         TranspilerError: If the ``method`` kwarg is not a valid value
     """
+    absorb = []
+    if optimization_level in (2, 3):
+        # Only the level 3 loop re-runs the peephole on the blocks around a merged swap, so only
+        # there can a short-T2 qubit be left with trailing single-qubit gates.
+        absorb.append(_AbsorbIntoSwaps(target=target if optimization_level == 3 else None))
     if basis_gates is None and target is None:
-        return PassManager([])
+        return PassManager(absorb)
 
     if method == "translator":
         translator = BasisTranslator(sel, basis_gates, target)
@@ -591,7 +603,7 @@ def generate_translation_passmanager(
         )
     if target is not None and target.has_angle_bounds():
         unroll.append(WrapAngles(target))
-    return PassManager(unroll)
+    return PassManager(absorb + unroll)
 
 
 def generate_scheduling(instruction_durations, scheduling_method, timing_constraints, target=None):
