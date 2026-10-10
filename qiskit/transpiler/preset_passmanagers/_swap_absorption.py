@@ -14,8 +14,8 @@
 
 import numpy as np
 
-from qiskit.circuit import Qubit
-from qiskit.circuit.library import UnitaryGate
+from qiskit.circuit import Gate, Qubit
+from qiskit.circuit.library import CZGate, SwapGate, UnitaryGate
 from qiskit.dagcircuit import DAGCircuit
 from qiskit.transpiler.basepasses import TransformationPass
 
@@ -46,6 +46,10 @@ class _AbsorbIntoSwaps(TransformationPass):
     applied after routing. A unit is a
     standard gate, a diagonal ``UnitaryGate`` or ``cx(a, b); D(b); cx(a, b)`` with ``D`` diagonal;
     it only passes units that commute with the same Pauli on each shared qubit, never a SWAP.
+    For a SWAP no unit reaches that way, the single-qubit gates right next to it on a unit's side
+    may first cross it onto its other qubit, as ``SWAP (g x I) = (I x g) SWAP``.
+    An existing CZ block can move as a whole, preserving its internal order, when every member
+    commutes with every external operation it crosses.
 
     A SWAP is left alone when one of its qubits would end on the merged block's single-qubit
     gates: when the qubit does no further multi-qubit work after it, or when, given a ``target``
@@ -79,7 +83,7 @@ def _short_t2_qubits(target, num_qubits):
 
 
 def _find_moves(dag, short_t2=frozenset()):
-    """Return the operations in topological order, their units and the ``(unit, swap, side)`` moves.
+    """Return operations, units and ``(unit, swap, side, hopped_nodes)`` moves.
 
     Operations and qubits are referred to by index; ``short_t2`` holds the qubits the T2 part of
     the tail rule applies to.
@@ -143,10 +147,17 @@ def _find_moves(dag, short_t2=frozenset()):
         (qubit, unit): index for qubit, seq in enumerate(sequence) for index, unit in enumerate(seq)
     }
 
-    def commutes_between(qubit, unit, swap):
-        """Whether ``unit`` commutes with every unit between it and ``swap`` on ``qubit``."""
+    def commutes_between(qubit, unit, swap, skip=0):
+        """Whether ``unit`` commutes with every unit between it and ``swap`` on ``qubit``.
+
+        The ``skip`` units next to ``swap`` are left out (they are hopped across it).
+        """
         pauli = units[unit][2][qubit]
         low, high = sorted((unit_position[(qubit, unit)], unit_position[(qubit, swap)]))
+        if unit_position[(qubit, unit)] < unit_position[(qubit, swap)]:
+            high -= skip
+        else:
+            low += skip
         return pauli != "-" and all(
             units[other][2][qubit] == pauli for other in sequence[qubit][low + 1 : high]
         )
@@ -163,7 +174,7 @@ def _find_moves(dag, short_t2=frozenset()):
         for node in wires[qubit][index + 1 :]:
             if (
                 len(qargs[node]) < 2
-                or unit_of[node] == unit
+                or unit_of[node] in compound_sources.get(unit, {unit})
                 or getattr(order[node].op, "_directive", False)
             ):
                 continue
@@ -181,6 +192,8 @@ def _find_moves(dag, short_t2=frozenset()):
     # A SWAP already adjacent (on both wires) to another unit of its pair is left alone, and so is
     # that unit; the peephole optimization merges them as they are.
     taken = set()
+    destinations = {}
+    compound_sources = {}
     pending = []
     for swap in swaps:
         pair = units[swap][1]
@@ -196,20 +209,116 @@ def _find_moves(dag, short_t2=frozenset()):
             taken.update(touching)
         else:
             pending.append(swap)
-    moves = []
-    for swap in pending:
+
+    def hop_run(qubit, swap, step):
+        """Single-qubit gates next to ``swap`` on ``qubit``, towards ``step``, nearest first.
+
+        ``SWAP (g x I) = (I x g) SWAP`` for every single-qubit gate ``g``, so these can be moved
+        to the other qubit on the other side of the SWAP, out of a unit's way.
+        """
+        seq, run = sequence[qubit], []
+        index = unit_position[(qubit, swap)] + step
+        while 0 <= index < len(seq) and len(units[seq[index]][1]) == 1:
+            node = units[seq[index]][0][0]
+            if node in hopped or seq[index] in taken or not isinstance(order[node].op, Gate):
+                break
+            run.append(node)
+            index += step
+        return run
+
+    def has_same_pair_block(unit, step):
+        """Whether moving the unit would split an existing same-pair two-qubit run."""
+        pair = units[unit][1]
+        neighbours = []
+        for qubit in pair:
+            seq = sequence[qubit]
+            index = unit_position[(qubit, unit)] + step
+            while 0 <= index < len(seq) and len(units[seq[index]][1]) == 1:
+                index += step
+            neighbours.append(seq[index] if 0 <= index < len(seq) else None)
+        return (
+            neighbours[0] is not None
+            and neighbours[0] == neighbours[1]
+            and units[neighbours[0]][1] == pair
+        )
+
+    def gap_remains(qubit, unit, swap):
+        """Whether another multi-qubit unit remains between the donor and the SWAP."""
+        low, high = sorted((unit_position[(qubit, unit)], unit_position[(qubit, swap)]))
+        return any(
+            len(units[other][1]) > 1
+            and (
+                other not in destinations
+                or low < unit_position.get((qubit, destinations[other]), -1) < high
+            )
+            for other in sequence[qubit][low + 1 : high]
+        )
+
+    def donor_block(unit, swap, step, runs):
+        """A complete CZ block whose members commute with every external crossing, or None."""
+        if any(not isinstance(order[member].op, CZGate) for member in units[unit][0]):
+            return None
+        pair, original, cursor = units[unit][1], {unit}, unit
+        while has_same_pair_block(cursor, step):
+            proposed = set()
+            for qubit in pair:
+                seq = sequence[qubit]
+                index = unit_position[(qubit, cursor)] + step
+                while len(units[seq[index]][1]) == 1:
+                    proposed.add(seq[index])
+                    index += step
+                following = seq[index]
+            if any(not isinstance(order[member].op, CZGate) for member in units[following][0]):
+                return None
+            proposed.add(following)
+            if any(other in taken for other in proposed) or any(
+                member in hopped
+                or not isinstance(order[member].op, Gate)
+                or isinstance(order[member].op, SwapGate)
+                for other in proposed
+                for member in units[other][0]
+            ):
+                return None
+            original.update(proposed)
+            cursor = following
+        for other in original:
+            for qubit in units[other][1]:
+                low, high = sorted((unit_position[(qubit, other)], unit_position[(qubit, swap)]))
+                if unit_position[(qubit, other)] < unit_position[(qubit, swap)]:
+                    high -= len(runs[qubit])
+                else:
+                    low += len(runs[qubit])
+                pauli = units[other][2][qubit]
+                if any(
+                    blocker not in original and (pauli == "-" or units[blocker][2][qubit] != pauli)
+                    for blocker in sequence[qubit][low + 1 : high]
+                ):
+                    return None
+        compound = len(units)
+        members = sorted(member for other in original for member in units[other][0])
+        units.append((members, pair, units[unit][2]))
+        compound_sources[compound] = original
+        for qubit in pair:
+            unit_position[(qubit, compound)] = unit_position[(qubit, unit)]
+        return compound
+
+    def search(swap, hop):
+        """The move for ``swap``, or ``None``; with ``hop``, gates from ``hop_run`` may be hopped."""
         pair = units[swap][1]
+        node = units[swap][0][0]
         # A qubit that does no further multi-qubit work after the SWAP would end on the merged
         # block's trailing single-qubit gates, which an as-late-as-possible schedule leaves waiting
         # until the end of the circuit; leave the SWAP decomposition there.
-        node = units[swap][0][0]
         if any(last_multi[q] <= i for q, i in zip(qargs[node], position[node])):
-            continue
+            return None
         # Look for the nearest unit of the pair on either side of the SWAP.
         qubit = qargs[node][0]
         seq = sequence[qubit]
         for step in (1, -1):
-            index = unit_position[(qubit, swap)] + step
+            runs = {q: hop_run(q, swap, step) if hop else [] for q in pair}
+            if hop and not any(runs.values()):
+                continue
+            index = unit_position[(qubit, swap)] + step * (1 + len(runs[qubit]))
             # Walk to the nearest unit of the pair, stopping at a unit nothing can be moved past.
             while (
                 0 <= index < len(seq)
@@ -222,31 +331,58 @@ def _find_moves(dag, short_t2=frozenset()):
                 unit is not None
                 and units[unit][1] == pair
                 and unit not in taken
-                and all(commutes_between(q, unit, swap) for q in pair)
+                and all(commutes_between(q, unit, swap, len(runs[q])) for q in pair)
             ):
+                if hop and has_same_pair_block(unit, step):
+                    unit = donor_block(unit, swap, step, runs)
+                    if unit is None:
+                        return None
+                if hop and not any(gap_remains(q, unit, swap) for q in pair):
+                    return None
                 # A SWAP the tail rule leaves alone is not tried on its other side either.
-                if not any(
-                    ends_on_one_pair(q, i, unit) for q, i in zip(qargs[node], position[node])
-                ):
-                    taken.add(unit)
-                    moves.append((unit, swap, step))
-                break
+                if any(ends_on_one_pair(q, i, unit) for q, i in zip(qargs[node], position[node])):
+                    return None
+                return (unit, swap, step, [n for q in pair for n in runs[q]])
+        return None
+
+    moves = []
+    for swap in pending:
+        if (move := search(swap, False)) is not None:
+            taken.add(move[0])
+            moves.append(move)
+            destinations[move[0]] = move[1]
+    hopped = set()
+    moved = {move[1] for move in moves}
+    for swap in pending:
+        if swap not in moved and (move := search(swap, True)) is not None:
+            taken.add(move[0])
+            hopped.update(move[3])
+            moves.append(move)
+            destinations[move[0]] = move[1]
+            taken.update(compound_sources.get(move[0], ()))
+            for original in compound_sources.get(move[0], ()):
+                destinations[original] = move[1]
     return order, units, moves
 
 
 def _apply_moves(dag, order, units, moves):
-    """Move every unit in ``moves`` in place, right next to its SWAP."""
-    for unit, _, _ in moves:
-        for member in units[unit][0]:
+    """Move every unit in ``moves`` in place, right next to its SWAP, hopping the gates listed."""
+    for unit, _, _, hops in moves:
+        for member in [*units[unit][0], *hops]:
             dag.remove_op_node(order[member])
-    for unit, swap, step in moves:
+    for unit, swap, step, hops in moves:
         swap_node = order[units[swap][0][0]]
         block = DAGCircuit()
         block.add_qubits(qubits := [Qubit(), Qubit()])
         wire_map = dict(zip(swap_node.qargs, qubits))
-        members = [order[member] for member in units[unit][0]]
-        for node in [swap_node, *members] if step > 0 else [*members, swap_node]:
-            block.apply_operation_back(node.op, [wire_map[q] for q in node.qargs], check=False)
+        hop_map = dict(zip(swap_node.qargs, reversed(qubits)))
+        hopped = [(order[hop], hop_map) for hop in sorted(hops)]
+        members = [(order[member], wire_map) for member in units[unit][0]]
+        swap_op = [(swap_node, wire_map)]
+        for node, qmap in (
+            [*hopped, *swap_op, *members] if step > 0 else [*members, *swap_op, *hopped]
+        ):
+            block.apply_operation_back(node.op, [qmap[q] for q in node.qargs], check=False)
         dag.substitute_node_with_dag(swap_node, block, wires=qubits)
     return dag
 
