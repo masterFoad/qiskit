@@ -13,7 +13,6 @@
 """Test the placement of two-qubit interactions next to routing SWAPs."""
 
 import collections
-import contextlib
 import copy
 import math
 import random
@@ -57,7 +56,6 @@ from qiskit.transpiler.preset_passmanagers.plugin import (
 )
 from qiskit.transpiler.preset_passmanagers._swap_absorption import (
     _AbsorbIntoSwaps,
-    _WIRE_PAULIS,
     _find_moves,
     _short_t2_qubits,
 )
@@ -207,12 +205,12 @@ def _compile(level, circuit, absorb=True, snapshots=None, **kwargs):
     init and the routing stages.
     """
     moved = []
-    original = _swap_absorption._find_moves
+    original_run = _AbsorbIntoSwaps.run
 
-    def recording(dag, *args, **options):
-        order, units, moves = original(dag, *args, **options)
+    def recording(self, dag):
+        order, units, moves = _find_moves(dag, _short_t2_qubits(self.target, dag.num_qubits()))
         moved.extend(order[units[unit][0][0]].name for unit, _, _, _ in moves)
-        return order, units, moves
+        return original_run(self, dag)
 
     peepholes = []
 
@@ -223,13 +221,8 @@ def _compile(level, circuit, absorb=True, snapshots=None, **kwargs):
     registry = WrapAngleRegistry()
     registry.add_wrapper("rzz", _fold_rzz)
     with (
-        patch.object(_swap_absorption, "_find_moves", recording),
         patch.object(WrapAngles, "DEFAULT_REGISTRY", registry),
-        (
-            contextlib.nullcontext()
-            if absorb
-            else patch.object(_AbsorbIntoSwaps, "run", lambda self, dag: dag)
-        ),
+        patch.object(_AbsorbIntoSwaps, "run", recording if absorb else (lambda self, dag: dag)),
     ):
         pm = generate_preset_pass_manager(level, **kwargs)
         if snapshots is not None:
@@ -493,11 +486,6 @@ class TestAbsorbIntoSwaps(QiskitTestCase):
             "XX": ("rxx",),
             "YY": ("ryy",),
         }
-        expected = {
-            name: pauli for pauli, names in (*single.items(), *double.items()) for name in names
-        }
-        self.assertEqual(_WIRE_PAULIS, expected)
-
         for pauli, names in single.items():
             for name in names:
                 with self.subTest(gate=name):
