@@ -50,6 +50,7 @@ pub mod sabre;
 mod schedule_analysis;
 mod split_2q_unitaries;
 mod substitute_pi4_rotations;
+mod swap_absorption;
 mod synthesize_rz_rotations;
 mod two_qubit_peephole;
 pub mod unitary_synthesis;
@@ -104,6 +105,7 @@ pub use schedule_analysis::asap_schedule_analysis::{
 pub use schedule_analysis::scheduling_mod;
 pub use split_2q_unitaries::{run_split_2q_unitaries, split_2q_unitaries_mod};
 pub use substitute_pi4_rotations::{run_substitute_pi4_rotations, substitute_pi4_rotations_mod};
+pub use swap_absorption::{run_absorb_into_swaps, swap_absorption_mod};
 pub use synthesize_rz_rotations::{py_run_synthesize_rz_rotations, synthesize_rz_rotations_mod};
 pub use two_qubit_peephole::{
     py_two_qubit_unitary_peephole_optimize, two_qubit_peephole_mod,
