@@ -31,18 +31,5 @@ upgrade_transpiler:
     different circuit.  The swaps chosen by routing are unchanged, but at ``optimization_level=3``
     the final :class:`.VF2PostLayout` can choose a different physical layout for the changed
     circuit.  A ``swap`` is left in place when one of its qubits does no further multi-qubit work
-    after it.  At ``optimization_level=3`` a ``swap`` is also left in place when one of its qubits
-    has a :class:`.Target` T2 below 10 microseconds, is not measured afterwards, and all its
-    remaining multi-qubit operations, other than the moved interaction, act on the same set of
-    qubits.
-    Translation stage plugins that do not pass ``optimization_level`` to
+    after it.  Translation stage plugins that do not pass ``optimization_level`` to
     :func:`.generate_translation_passmanager` do not run this step.
-fixes:
-  - |
-    The optimization loop of the preset pass managers at ``optimization_level=3`` now runs
-    :class:`.WrapAngles` right after :class:`.TwoQubitPeepholeOptimization` when the
-    :class:`.Target` has angle bounds, for example a fractional ``rzz`` bounded to ``[0, pi/2]``.
-    The peephole could synthesize angles outside those bounds, so the basis check in the loop
-    failed in every iteration and the loop did not reach a fixed point.  The loop now converges in
-    fewer iterations on such targets, and its output on them can change even for circuits that
-    contain no ``swap``.

@@ -492,9 +492,7 @@ def generate_translation_passmanager(
     """
     absorb = []
     if optimization_level in (2, 3):
-        # Only the level 3 loop re-runs the peephole on the blocks around a merged swap, so only
-        # there can a short-T2 qubit be left with trailing single-qubit gates.
-        absorb.append(_AbsorbIntoSwaps(target=target if optimization_level == 3 else None))
+        absorb.append(_AbsorbIntoSwaps())
     if basis_gates is None and target is None:
         return PassManager(absorb)
 

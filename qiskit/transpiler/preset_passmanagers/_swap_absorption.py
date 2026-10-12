@@ -20,7 +20,6 @@ from qiskit.circuit import Qubit
 from qiskit.circuit.library import UnitaryGate
 from qiskit.dagcircuit import DAGCircuit, DAGOpNode
 from qiskit.transpiler.basepasses import TransformationPass
-from qiskit.transpiler.target import Target
 
 # For each standard gate, the single-qubit Pauli it commutes with on each of its qubits ("-" for
 # none).  Two operations that, on every qubit they share, commute with the same Pauli commute
@@ -34,8 +33,6 @@ _WIRE_PAULIS = {
     "rxx": "XX",
     "ryy": "YY",
 }
-# T2 time, in seconds, below which a qubit is subject to the tail rule of ``_find_moves``.
-_TAIL_T2_THRESHOLD = 10e-6
 
 
 class _AbsorbIntoSwaps(TransformationPass):
@@ -50,10 +47,8 @@ class _AbsorbIntoSwaps(TransformationPass):
 
     A ``swap`` is left alone when one of its qubits would end on the merged block's single-qubit
     gates, which an as-late-as-possible schedule leaves idle until the end of the circuit.  That
-    is the case when the qubit does no further multi-qubit work after the ``swap``.  With a
-    ``target`` that reports the qubit's T2 below ``_TAIL_T2_THRESHOLD``, the tail rule also leaves
-    the ``swap`` alone when the qubit is not measured afterwards and all its remaining multi-qubit
-    operations, other than the moved unit, act on the same set of qubits.
+    is the case when no multi-qubit operation follows the ``swap`` on the qubit.  Directives such
+    as a ``barrier`` count as multi-qubit operations here, as they fence the qubit's schedule.
 
     References:
 
@@ -64,38 +59,18 @@ class _AbsorbIntoSwaps(TransformationPass):
     algorithms. `arXiv:2108.02099 <https://arxiv.org/abs/2108.02099>`_
     """
 
-    def __init__(self, target: Target | None = None):
-        """
-        Args:
-            target: The target whose qubit T2 times enable the tail rule.  If ``None``, only
-                the qubits' remaining multi-qubit work decides whether a ``swap`` is left alone.
-        """
-        super().__init__()
-        self.target = target
-
     def run(self, dag: DAGCircuit) -> DAGCircuit:
         if "swap" not in dag.count_ops(recurse=False):
             return dag
-        order, units, moves = _find_moves(dag, _short_t2_qubits(self.target, dag.num_qubits()))
+        order, units, moves = _find_moves(dag)
         return _apply_moves(dag, order, units, moves) if moves else dag
 
 
-def _short_t2_qubits(target: Target | None, num_qubits: int) -> frozenset[int]:
-    """Indices of the qubits whose ``target`` T2 is known and below ``_TAIL_T2_THRESHOLD``."""
-    properties = getattr(target, "qubit_properties", None) or ()
-    return frozenset(
-        index
-        for index, prop in enumerate(properties[:num_qubits])
-        if getattr(prop, "t2", None) is not None and prop.t2 < _TAIL_T2_THRESHOLD
-    )
-
-
-def _find_moves(dag: DAGCircuit, short_t2: frozenset[int] = frozenset()):
+def _find_moves(dag: DAGCircuit):
     """Find the units to move next to a ``swap``.
 
     Args:
         dag: The circuit to search.
-        short_t2: Indices of the qubits the tail rule applies to.
 
     Returns:
         tuple: The operations in topological order, the units, and the moves as
@@ -111,19 +86,12 @@ def _find_moves(dag: DAGCircuit, short_t2: frozenset[int] = frozenset()):
         position.append(tuple(len(wires[qubit]) for qubit in qubits))
         for qubit in qubits:
             wires[qubit].append(node)
-    # Position on each wire of its last multi-qubit operation.
+    # Position on each wire of its last multi-qubit operation, a directive such as a barrier
+    # included.
     last_multi = [
         max((i for i, node in enumerate(nodes) if len(qargs[node]) > 1), default=-1)
         for nodes in wires
     ]
-    # Position on each wire of its last measurement, for the qubits the tail rule applies to.
-    last_measure = {
-        qubit: max(
-            (i for i, node in enumerate(wires[qubit]) if order[node].name == "measure"), default=-1
-        )
-        for qubit in short_t2
-        if qubit < len(wires)
-    }
 
     def after(node, i):
         """The operation after ``node`` on the wire of its ``i``-th qubit."""
@@ -131,10 +99,10 @@ def _find_moves(dag: DAGCircuit, short_t2: frozenset[int] = frozenset()):
         return nodes[position[node][i] + 1] if position[node][i] + 1 < len(nodes) else None
 
     # Group the operations into units, each with the Pauli it commutes with on each of its qubits.
-    unit_of = [None] * len(order)
-    units = []
+    unit_of: list[int] = [-1] * len(order)
+    units: list[tuple[list[int], frozenset[int], dict[int, str]]] = []
     for node, op_node in enumerate(order):
-        if unit_of[node] is not None:
+        if unit_of[node] >= 0:
             continue
         members = [node]
         paulis = dict(zip(qargs[node], _wire_paulis(op_node)))
@@ -168,28 +136,6 @@ def _find_moves(dag: DAGCircuit, short_t2: frozenset[int] = frozenset()):
         return pauli != "-" and all(
             units[other][2][qubit] == pauli for other in sequence[qubit][low + 1 : high]
         )
-
-    def ends_on_one_pair(qubit, index, unit):
-        """Whether the tail rule leaves the ``swap`` at ``index`` on the wire of ``qubit`` alone.
-
-        That is when ``qubit`` has a short T2, is not measured after the ``swap``, and its
-        multi-qubit units after the ``swap`` other than ``unit`` all act on one set of qubits.
-        """
-        if qubit not in short_t2 or last_measure[qubit] > index:
-            return False
-        seen = None
-        for node in wires[qubit][index + 1 :]:
-            if (
-                len(qargs[node]) < 2
-                or unit_of[node] == unit
-                or getattr(order[node].op, "_directive", False)
-            ):
-                continue
-            if seen is None:
-                seen = units[unit_of[node]][1]
-            elif units[unit_of[node]][1] != seen:
-                return False
-        return True
 
     swaps = [
         unit
@@ -240,12 +186,8 @@ def _find_moves(dag: DAGCircuit, short_t2: frozenset[int] = frozenset()):
                 and unit not in taken
                 and all(commutes_between(q, unit, swap) for q in pair)
             ):
-                # A SWAP the tail rule leaves alone is not tried on its other side either.
-                if not any(
-                    ends_on_one_pair(q, i, unit) for q, i in zip(qargs[node], position[node])
-                ):
-                    taken.add(unit)
-                    moves.append((unit, swap, step))
+                taken.add(unit)
+                moves.append((unit, swap, step))
                 break
     return order, units, moves
 
