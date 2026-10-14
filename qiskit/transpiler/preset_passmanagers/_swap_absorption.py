@@ -137,6 +137,22 @@ def _find_moves(dag: DAGCircuit):
             units[other][2][qubit] == pauli for other in sequence[qubit][low + 1 : high]
         )
 
+    def splits_same_pair_run(unit, step):
+        """Whether moving ``unit`` would split a same-pair run on its far side."""
+        pair = units[unit][1]
+        neighbours = []
+        for qubit in pair:
+            seq = sequence[qubit]
+            index = unit_position[(qubit, unit)] + step
+            while 0 <= index < len(seq) and len(units[seq[index]][1]) == 1:
+                index += step
+            neighbours.append(seq[index] if 0 <= index < len(seq) else None)
+        return (
+            neighbours[0] is not None
+            and neighbours[0] == neighbours[1]
+            and units[neighbours[0]][1] == pair
+        )
+
     swaps = [
         unit
         for unit, (members, _, _) in enumerate(units)
@@ -185,6 +201,7 @@ def _find_moves(dag: DAGCircuit):
                 and units[unit][1] == pair
                 and unit not in taken
                 and all(commutes_between(q, unit, swap) for q in pair)
+                and not splits_same_pair_run(unit, step)
             ):
                 taken.add(unit)
                 moves.append((unit, swap, step))

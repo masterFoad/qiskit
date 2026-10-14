@@ -576,6 +576,41 @@ class TestAbsorbIntoSwaps(QiskitTestCase):
             with self.subTest(name):
                 self.assertEqual(_run(qc), qc)
 
+    def test_same_pair_run_is_not_split(self):
+        """An interaction is not pulled away from a same-pair neighbour in either direction."""
+        forward = QuantumCircuit(4)
+        forward.swap(0, 1)
+        forward.rz(0.1, [0, 1])
+        forward.cp(0.3, 1, 0)
+        forward.rz(0.2, [0, 1])
+        forward.cz(0, 1)
+        forward.cx(0, 2)
+        forward.cx(1, 3)
+        backward = QuantumCircuit(4)
+        backward.cz(1, 0)
+        backward.rz(0.2, [0, 1])
+        backward.cp(0.3, 0, 1)
+        backward.rz(0.1, [0, 1])
+        backward.swap(1, 0)
+        backward.cx(0, 2)
+        backward.cx(1, 3)
+        for circuit in (forward, backward):
+            with self.subTest(circuit=circuit):
+                self.assertFalse(_find_moves(circuit_to_dag(circuit))[2])
+                self.assertEqual(_run(circuit), circuit)
+
+    def test_different_pair_after_interaction_is_eligible(self):
+        """A neighbour on another pair does not prevent absorption."""
+        qc = QuantumCircuit(4)
+        qc.swap(0, 1)
+        qc.rz(0.1, [0, 1])
+        qc.cp(0.3, 1, 0)
+        qc.rz(0.2, [0, 1])
+        qc.cz(0, 2)
+        qc.cz(1, 3)
+        self.assertEqual(len(_find_moves(circuit_to_dag(qc))[2]), 1)
+        self.assertTrue(Operator(_run(qc)).equiv(Operator(qc)))
+
     def test_two_overlapping_moves(self):
         """Two CP moves may share one qubit across their SWAP pairs."""
         qc = QuantumCircuit(4)
