@@ -525,8 +525,7 @@ class TestAbsorbIntoSwaps(QiskitTestCase):
 
     def test_blocked_moves_leave_circuit_unchanged(self):
         """No move crosses an operation that blocks it, and lookalike gates are not moved."""
-        one, two = QuantumCircuit(1), QuantumCircuit(2)
-        one.h(0)
+        two = QuantumCircuit(2)
         two.h(0)
         cx_definition = QuantumCircuit(2)
         cx_definition.cx(0, 1)
@@ -547,21 +546,19 @@ class TestAbsorbIntoSwaps(QiskitTestCase):
         wire_end.h(1)
         non_commuting = QuantumCircuit(2)
         non_commuting.cp(0.3, 0, 1)
-        non_commuting.h(0)
+        non_commuting.cx(0, 1)
         non_commuting.swap(0, 1)
         non_commuting.measure_all()
         adjacent = QuantumCircuit(3)
         adjacent.cz(0, 1)
-        adjacent.compose(_swap_circuit((RZGate(0.2), [0])), inplace=True)
+        adjacent.compose(_swap_circuit((CZGate(), [0, 1]), (RZGate(0.2), [0])), inplace=True)
         cases = {
             "control flow": control_flow,
             "barrier": _swap_circuit((Barrier(2), [0, 1])),
             "swap ending a wire": wire_end,
             "non-commuting gate": non_commuting,
-            "swap already next to a term": adjacent,
-            "cx after a gate diagonal on its target": _swap_circuit(
-                (RZGate(0.2), [1]), interaction=CXGate()
-            ),
+            "swap already next to a term on both sides": adjacent,
+            "cx after a cz": _swap_circuit((CZGate(), [1, 2]), interaction=CXGate()),
             "custom gate named swap": _swap_circuit(
                 (RZGate(0.2), [0]), swap=_custom_gate("swap", cx_definition)
             ),
@@ -571,7 +568,6 @@ class TestAbsorbIntoSwaps(QiskitTestCase):
         }
         for name in ("cp", "cx", "unitary"):
             cases[f"custom gate named {name}"] = _swap_circuit((_custom_gate(name, two), [0, 2]))
-        cases["custom gate named rz"] = _swap_circuit((_custom_gate("rz", one), [0]))
         for name, qc in cases.items():
             with self.subTest(name):
                 self.assertEqual(_run(qc), qc)
@@ -609,6 +605,111 @@ class TestAbsorbIntoSwaps(QiskitTestCase):
         qc.cz(0, 2)
         qc.cz(1, 3)
         self.assertEqual(len(_find_moves(circuit_to_dag(qc))[2]), 1)
+        self.assertTrue(Operator(_run(qc)).equiv(Operator(qc)))
+
+    def test_single_qubit_gates_cross_swap(self):
+        """Single-qubit gates next to a SWAP that stand in the way of a unit move across it, onto
+        its other qubit."""
+        qc = QuantumCircuit(3)
+        qc.swap(0, 1)
+        qc.h(0)
+        qc.sx(1)
+        qc.cz(0, 2)
+        qc.cp(0.3, 0, 1)
+        qc.cx(0, 2)
+        qc.cx(1, 2)
+        expected = QuantumCircuit(3)
+        expected.h(1)
+        expected.sx(0)
+        expected.swap(0, 1)
+        expected.cp(0.3, 0, 1)
+        expected.cz(0, 2)
+        expected.cx(0, 2)
+        expected.cx(1, 2)
+        self.assertEqual(_run(qc), expected)
+        one = QuantumCircuit(1)
+        one.h(0)
+        backward = QuantumCircuit(3)
+        backward.cp(0.3, 0, 1)
+        backward.h(0)
+        backward.swap(0, 1)
+        backward.cx(0, 2)
+        backward.cx(1, 2)
+        cases = {
+            "backward": backward,
+            "custom gate named rz": _swap_circuit((_custom_gate("rz", one), [0])),
+            "cx after a gate diagonal on its target": _swap_circuit(
+                (RZGate(0.2), [1]), interaction=CXGate()
+            ),
+        }
+        for name, circuit in cases.items():
+            with self.subTest(name):
+                out = _run(circuit)
+                self.assertNotEqual(out, circuit)
+                self.assertTrue(Operator(out).equiv(Operator(circuit)))
+
+    def test_gates_out_of_the_way_stay(self):
+        """Single-qubit gates that do not stand in the way of a unit stay where they are."""
+        qc = _swap_circuit((RZGate(0.2), [0]), (CZGate(), [1, 2]))
+        out = _run(qc)
+        self.assertEqual(out.data[2].operation.name, "rz")
+        self.assertEqual(out.data[1].operation.name, "cp")
+        self.assertTrue(Operator(out).equiv(Operator(qc)))
+
+    def test_units_on_both_sides(self):
+        """A SWAP takes a unit of its pair from each side, as one block."""
+        qc = QuantumCircuit(4)
+        qc.cp(0.2, 0, 1)
+        qc.cz(0, 2)
+        qc.swap(0, 1)
+        qc.cz(1, 3)
+        qc.rzz(0.3, 0, 1)
+        qc.cx(0, 2)
+        qc.cx(1, 3)
+        expected = QuantumCircuit(4)
+        expected.cz(0, 2)
+        expected.cp(0.2, 0, 1)
+        expected.swap(0, 1)
+        expected.rzz(0.3, 0, 1)
+        expected.cz(1, 3)
+        expected.cx(0, 2)
+        expected.cx(1, 3)
+        self.assertEqual(_run(qc), expected)
+
+    def test_adjacent_unit_leaves_other_side_open(self):
+        """A unit already next to a SWAP does not stop another unit joining from the other side."""
+        qc = QuantumCircuit(3)
+        qc.cz(0, 1)
+        qc.swap(0, 1)
+        qc.cz(0, 2)
+        qc.cp(0.3, 0, 1)
+        qc.cx(0, 2)
+        qc.cx(1, 2)
+        expected = QuantumCircuit(3)
+        expected.cz(0, 1)
+        expected.swap(0, 1)
+        expected.cp(0.3, 0, 1)
+        expected.cz(0, 2)
+        expected.cx(0, 2)
+        expected.cx(1, 2)
+        self.assertEqual(_run(qc), expected)
+
+    def test_gates_cross_on_one_side_only(self):
+        """Single-qubit gates cross a SWAP from one side only, even when units on both sides need
+        it."""
+        qc = QuantumCircuit(4)
+        qc.cp(0.2, 0, 1)
+        qc.cz(0, 2)
+        qc.h(0)
+        qc.swap(0, 1)
+        qc.h(1)
+        qc.cz(1, 3)
+        qc.rzz(0.3, 0, 1)
+        qc.cx(0, 2)
+        qc.cx(1, 3)
+        _, units, moves = _find_moves(circuit_to_dag(qc))
+        self.assertEqual(sum(len(units[unit][1]) == 2 for unit, _, _ in moves), 1)
+        self.assertEqual(len({step for _, _, step in moves}), 1)
         self.assertTrue(Operator(_run(qc)).equiv(Operator(qc)))
 
     def test_two_overlapping_moves(self):

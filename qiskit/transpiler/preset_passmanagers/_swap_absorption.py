@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from qiskit.circuit import Qubit
+from qiskit.circuit import Gate, Qubit
 from qiskit.circuit.library import UnitaryGate
 from qiskit.dagcircuit import DAGCircuit, DAGOpNode
 from qiskit.transpiler.basepasses import TransformationPass
@@ -44,6 +44,9 @@ class _AbsorbIntoSwaps(TransformationPass):
     moved is a standard gate, a diagonal two-qubit :class:`.UnitaryGate`, or
     ``cx(a, b); D(b); cx(a, b)`` with ``D`` diagonal.  It is only moved past units that commute
     with the same Pauli on every shared qubit, and never past a ``swap``.
+    A ``swap`` can take one unit from each side.  Single-qubit gates next to the ``swap`` that stand
+    in a unit's way cross it instead, onto its other qubit, as ``SWAP (g x I) = (I x g) SWAP``, on
+    one side of the ``swap`` only.
 
     A ``swap`` is left alone when one of its qubits would end on the merged block's single-qubit
     gates, which an as-late-as-possible schedule leaves idle until the end of the circuit.  That
@@ -75,7 +78,8 @@ def _find_moves(dag: DAGCircuit):
     Returns:
         tuple: The operations in topological order, the units, and the moves as
         ``(unit, swap, step)`` triples, where ``step`` is ``1`` if the unit is placed after the
-        ``swap`` and ``-1`` if before.  Operations, units and qubits are referred to by index.
+        ``swap`` and ``-1`` if before.  A single-qubit unit crosses the ``swap`` instead, from
+        side ``step`` onto the other qubit.  Operations, units and qubits are referred to by index.
     """
     order = list(dag.topological_op_nodes())
     qubit_index = {qubit: index for index, qubit in enumerate(dag.qubits)}
@@ -129,12 +133,14 @@ def _find_moves(dag: DAGCircuit):
         (qubit, unit): index for qubit, seq in enumerate(sequence) for index, unit in enumerate(seq)
     }
 
-    def commutes_between(qubit, unit, swap):
-        """Whether ``unit`` commutes with every unit between it and ``swap`` on ``qubit``."""
+    def commutes_between(qubit, unit, swap, hops):
+        """Whether ``unit`` commutes with every unit between it and ``swap`` on ``qubit``, other
+        than those in ``hops``."""
         pauli = units[unit][2][qubit]
         low, high = sorted((unit_position[(qubit, unit)], unit_position[(qubit, swap)]))
         return pauli != "-" and all(
-            units[other][2][qubit] == pauli for other in sequence[qubit][low + 1 : high]
+            other in hops or units[other][2][qubit] == pauli
+            for other in sequence[qubit][low + 1 : high]
         )
 
     def splits_same_pair_run(unit, step):
@@ -158,26 +164,21 @@ def _find_moves(dag: DAGCircuit):
         for unit, (members, _, _) in enumerate(units)
         if order[members[0]].name == "swap" and order[members[0]].is_standard_gate()
     ]
-    # A SWAP already adjacent (on both wires) to another unit of its pair is left alone, and so is
-    # that unit; the peephole optimization merges them as they are.
+    # A unit already adjacent (on both wires) to a SWAP of its pair is left alone, which leaves that
+    # side of the SWAP alone too; the peephole optimization merges them as they are.
     taken = set()
-    pending = []
     for swap in swaps:
         pair = units[swap][1]
-        touching = [
+        taken.update(
             unit
             for qubit in pair
             for index in (unit_position[(qubit, swap)] - 1, unit_position[(qubit, swap)] + 1)
             if 0 <= index < len(sequence[qubit])
             and units[unit := sequence[qubit][index]][1] == pair
             and all(abs(unit_position[(q, unit)] - unit_position[(q, swap)]) == 1 for q in pair)
-        ]
-        if touching:
-            taken.update(touching)
-        else:
-            pending.append(swap)
+        )
     moves = []
-    for swap in pending:
+    for swap in swaps:
         pair = units[swap][1]
         # A qubit with no further multi-qubit work would end on the merged block's single-qubit
         # gates, which an as-late-as-possible schedule leaves idle until the end of the circuit.
@@ -186,13 +187,27 @@ def _find_moves(dag: DAGCircuit):
             continue
         qubit = qargs[node][0]
         seq = sequence[qubit]
+        hopped = False
         for step in (1, -1):
+            # The single-qubit gates next to the SWAP on this side can cross it onto its other
+            # qubit, as ``SWAP (g x I) = (I x g) SWAP``, out of the way, on one side only.
+            hops = set()
+            for q in pair:
+                index = unit_position[(q, swap)] + step
+                while (
+                    not hopped
+                    and 0 <= index < len(sequence[q])
+                    and len(units[other := sequence[q][index]][1]) == 1
+                    and other not in taken
+                    and isinstance(order[units[other][0][0]].op, Gate)
+                ):
+                    hops.add(other)
+                    index += step
             index = unit_position[(qubit, swap)] + step
             # Walk to the nearest unit of the pair, stopping at a unit nothing can be moved past.
-            while (
-                0 <= index < len(seq)
-                and units[seq[index]][1] != pair
-                and units[seq[index]][2][qubit] != "-"
+            while 0 <= index < len(seq) and (
+                seq[index] in hops
+                or (units[seq[index]][1] != pair and units[seq[index]][2][qubit] != "-")
             ):
                 index += step
             unit = seq[index] if 0 <= index < len(seq) else None
@@ -200,28 +215,37 @@ def _find_moves(dag: DAGCircuit):
                 unit is not None
                 and units[unit][1] == pair
                 and unit not in taken
-                and all(commutes_between(q, unit, swap) for q in pair)
+                and all(commutes_between(q, unit, swap, hops) for q in pair)
                 and not splits_same_pair_run(unit, step)
             ):
-                taken.add(unit)
-                moves.append((unit, swap, step))
-                break
+                # The gates only cross the SWAP when the unit cannot move past them as they are.
+                if all(commutes_between(q, unit, swap, ()) for q in pair):
+                    hops = set()
+                taken.update((unit, *hops))
+                moves.extend((other, swap, step) for other in (unit, *hops))
+                hopped = bool(hops)
     return order, units, moves
 
 
 def _apply_moves(dag: DAGCircuit, order, units, moves) -> DAGCircuit:
-    """Move every unit in ``moves`` in place, right next to its SWAP."""
-    for unit, _, _ in moves:
+    """Move every unit in ``moves`` in place, right next to its SWAP, but a single-qubit unit
+    across it, onto its other qubit."""
+    blocks = {}
+    for unit, swap, step in moves:
+        hop = len(units[unit][1]) == 1
         for member in units[unit][0]:
             dag.remove_op_node(order[member])
-    for unit, swap, step in moves:
+        blocks.setdefault(swap, [(0, units[swap][0][0], False)]).extend(
+            (-step if hop else step, member, hop) for member in units[unit][0]
+        )
+    for swap, placed in blocks.items():
         swap_node = order[units[swap][0][0]]
         block = DAGCircuit()
         block.add_qubits(qubits := [Qubit(), Qubit()])
-        wire_map = dict(zip(swap_node.qargs, qubits))
-        members = [order[member] for member in units[unit][0]]
-        for node in [swap_node, *members] if step > 0 else [*members, swap_node]:
-            block.apply_operation_back(node.op, [wire_map[q] for q in node.qargs], check=False)
+        maps = (dict(zip(swap_node.qargs, qubits)), dict(zip(swap_node.qargs, qubits[::-1])))
+        for _, member, hop in sorted(placed):
+            node = order[member]
+            block.apply_operation_back(node.op, [maps[hop][q] for q in node.qargs], check=False)
         dag.substitute_node_with_dag(swap_node, block, wires=qubits)
     return dag
 
