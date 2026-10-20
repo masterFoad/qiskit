@@ -66,130 +66,244 @@ class _AbsorbIntoSwaps(TransformationPass):
         return _apply_moves(dag, order, units, moves) if moves else dag
 
 
+class _Members:
+    """``units[u]`` view: ``(members, qubits)`` of unit ``u``, the node indices and qubit indices
+    the guard's unit tuples start with (the guard's per-wire Pauli dict is not kept)."""
+
+    __slots__ = ("first", "groups", "q0", "q1", "qargs")
+
+    def __init__(self, first, groups, q0, q1, qargs):
+        self.first = first
+        self.groups = groups
+        self.q0 = q0
+        self.q1 = q1
+        self.qargs = qargs
+
+    def __len__(self):
+        return len(self.first)
+
+    def __getitem__(self, unit):
+        head = self.first[unit]
+        if self.q1[head] >= 0:
+            qubits = frozenset((self.q0[head], self.q1[head]))
+        else:
+            qubits = frozenset(self.qargs(head))
+        return (self.groups.get(unit) or [head], qubits)
+
+
 def _find_moves(dag: DAGCircuit):
-    """Find the units to move next to a ``swap``.
-
-    Args:
-        dag: The circuit to search.
-
-    Returns:
-        tuple: The operations in topological order, the units, and the moves as
-        ``(unit, swap, step)`` triples, where ``step`` is ``1`` if the unit is placed after the
-        ``swap`` and ``-1`` if before.  Operations, units and qubits are referred to by index.
-    """
     order = list(dag.topological_op_nodes())
-    qubit_index = {qubit: index for index, qubit in enumerate(dag.qubits)}
-    qargs = [tuple(qubit_index[qubit] for qubit in node.qargs) for node in order]
-    wires = [[] for _ in qubit_index]
-    position = []  # ``position[node][i]``: index of ``node`` on the wire of its ``i``-th qubit.
-    for node, qubits in enumerate(qargs):
-        position.append(tuple(len(wires[qubit]) for qubit in qubits))
-        for qubit in qubits:
-            wires[qubit].append(node)
-    # Position on each wire of its last multi-qubit operation, a directive such as a barrier
-    # included.
-    last_multi = [
-        max((i for i, node in enumerate(nodes) if len(qargs[node]) > 1), default=-1)
-        for nodes in wires
-    ]
+    getq = {qubit: index for index, qubit in enumerate(dag.qubits)}.__getitem__
+    num_wires = dag.num_qubits()
+    wires = [[] for _ in range(num_wires)]
+    last_multi = [-1] * num_wires
+    n = len(order)
+    q0 = [-1] * n
+    q1 = [-1] * n
+    p0 = [-1] * n
+    p1 = [-1] * n
+    nq = [0] * n
+    for node, op_node in enumerate(order):
+        qs = op_node.qargs
+        k = len(qs)
+        nq[node] = k
+        if k == 1:
+            a = getq(qs[0])
+            wa = wires[a]
+            q0[node] = a
+            p0[node] = len(wa)
+            wa.append(node)
+        elif k == 2:
+            a = getq(qs[0])
+            b = getq(qs[1])
+            wa = wires[a]
+            wb = wires[b]
+            q0[node] = a
+            q1[node] = b
+            p0[node] = last_multi[a] = len(wa)
+            p1[node] = last_multi[b] = len(wb)
+            wa.append(node)
+            wb.append(node)
+        else:
+            for qubit in qs:
+                w = wires[getq(qubit)]
+                if k > 1:
+                    last_multi[getq(qubit)] = len(w)
+                w.append(node)
 
-    def after(node, i):
-        """The operation after ``node`` on the wire of its ``i``-th qubit."""
-        nodes = wires[qargs[node][i]]
-        return nodes[position[node][i] + 1] if position[node][i] + 1 < len(nodes) else None
+    cache = {}
 
-    # Group the operations into units, each with the Pauli it commutes with on each of its qubits.
-    unit_of: list[int] = [-1] * len(order)
-    units: list[tuple[list[int], frozenset[int], dict[int, str]]] = []
+    def labels(op_node, k):
+        if op_node.is_standard_gate():
+            key = (op_node.name, k)
+            label = cache.get(key)
+            if label is None:
+                label = cache[key] = _WIRE_PAULIS.get(op_node.name, "-" * k)
+            return label
+        return _wire_paulis(op_node)
+
+    def next_on(node, a, pa):
+        nodes = wires[a]
+        return nodes[pa + 1] if pa + 1 < len(nodes) else None
+
+    # Units, numbered as in the guard.  ``ukey``: a pair key for two-qubit units, -2 for
+    # single-qubit units, -1 otherwise.
+    unit_of = [-1] * n
+    first = []
+    groups = {}
+    ulab = []
+    ukey = []
+    swaps = []
     for node, op_node in enumerate(order):
         if unit_of[node] >= 0:
             continue
-        members = [node]
-        paulis = dict(zip(qargs[node], _wire_paulis(op_node)))
-        if op_node.name == "cx" and op_node.is_standard_gate():
-            middle = after(node, 1)
+        k = nq[node]
+        label = labels(op_node, k)
+        unit = len(first)
+        if label == "ZX" and op_node.name == "cx" and op_node.is_standard_gate():
+            a, b = q0[node], q1[node]
+            middle = next_on(node, b, p1[node])
             if (
                 middle is not None
-                and _wire_paulis(order[middle]) == "Z"
-                and (last := after(middle, 0)) is not None
+                and labels(order[middle], nq[middle]) == "Z"
+                and (last := next_on(middle, b, p0[middle])) is not None
                 and order[last].name == "cx"
                 and order[last].is_standard_gate()
-                and qargs[last] == qargs[node]
-                and after(node, 0) == last
+                and q0[last] == a
+                and q1[last] == b
+                and nq[last] == 2
+                and next_on(node, a, p0[node]) == last
             ):
-                members = [node, middle, last]
-                paulis = dict.fromkeys(qargs[node], "Z")
-        for member in members:
-            unit_of[member] = len(units)
-        units.append((members, frozenset(qargs[node]), paulis))
+                groups[unit] = [node, middle, last]
+                unit_of[middle] = unit_of[last] = unit
+                label = "ZZ"
+        unit_of[node] = unit
+        first.append(node)
+        ulab.append(label)
+        if k == 2:
+            a, b = q0[node], q1[node]
+            ukey.append(a * num_wires + b if a < b else b * num_wires + a)
+            if op_node.name == "swap" and op_node.is_standard_gate():
+                swaps.append(unit)
+        else:
+            ukey.append(-2 if k == 1 else -1)
 
-    sequence = [[unit_of[node] for node in nodes] for nodes in wires]
-    sequence = [[u for i, u in enumerate(seq) if i == 0 or u != seq[i - 1]] for seq in sequence]
-    unit_position = {
-        (qubit, unit): index for qubit, seq in enumerate(sequence) for index, unit in enumerate(seq)
-    }
+    # Per wire: units in order (consecutive repeats merged), their label on the wire, and the
+    # start of the run of equal labels each position belongs to.  ``pos0``/``pos1``: position of a
+    # two-qubit unit on the wire of its first/second qubit.
+    num_units = len(first)
+    pos0 = [-1] * num_units
+    pos1 = [-1] * num_units
+    sequence = []
+    seq_lab = []
+    run_start = []
+    for qubit in range(num_wires):
+        seq = []
+        labs = []
+        starts = []
+        prev = -1
+        for node in wires[qubit]:
+            unit = unit_of[node]
+            if unit == prev:
+                continue
+            prev = unit
+            i = len(seq)
+            label = ulab[unit]
+            head = first[unit]
+            if ukey[unit] >= 0:
+                if q0[head] == qubit:
+                    pos0[unit] = i
+                    label = label[0]
+                else:
+                    pos1[unit] = i
+                    label = label[1]
+            else:
+                label = label[0] if label else "-"
+            starts.append(starts[-1] if i and labs[-1] == label else i)
+            seq.append(unit)
+            labs.append(label)
+        sequence.append(seq)
+        seq_lab.append(labs)
+        run_start.append(starts)
+
+    def place(qubit, unit):
+        return pos0[unit] if q0[first[unit]] == qubit else pos1[unit]
 
     def commutes_between(qubit, unit, swap):
-        """Whether ``unit`` commutes with every unit between it and ``swap`` on ``qubit``."""
-        pauli = units[unit][2][qubit]
-        low, high = sorted((unit_position[(qubit, unit)], unit_position[(qubit, swap)]))
-        return pauli != "-" and all(
-            units[other][2][qubit] == pauli for other in sequence[qubit][low + 1 : high]
+        a, b = place(qubit, unit), place(qubit, swap)
+        low, high = (a, b) if a < b else (b, a)
+        labs = seq_lab[qubit]
+        pauli = labs[a]
+        if pauli == "-":
+            return False
+        return high - low <= 1 or (
+            labs[high - 1] == pauli and run_start[qubit][high - 1] <= low + 1
         )
 
-    swaps = [
-        unit
-        for unit, (members, _, _) in enumerate(units)
-        if order[members[0]].name == "swap" and order[members[0]].is_standard_gate()
-    ]
-    # A SWAP already adjacent (on both wires) to another unit of its pair is left alone, and so is
-    # that unit; the peephole optimization merges them as they are.
+    def splits_same_pair_run(unit, step, qa, qb):
+        neighbours = []
+        for qubit in (qa, qb):
+            seq = sequence[qubit]
+            index = place(qubit, unit) + step
+            while 0 <= index < len(seq) and ukey[seq[index]] == -2:
+                index += step
+            neighbours.append(seq[index] if 0 <= index < len(seq) else None)
+        return (
+            neighbours[0] is not None
+            and neighbours[0] == neighbours[1]
+            and ukey[neighbours[0]] == ukey[unit]
+        )
+
     taken = set()
     pending = []
     for swap in swaps:
-        pair = units[swap][1]
-        touching = [
-            unit
-            for qubit in pair
-            for index in (unit_position[(qubit, swap)] - 1, unit_position[(qubit, swap)] + 1)
-            if 0 <= index < len(sequence[qubit])
-            and units[unit := sequence[qubit][index]][1] == pair
-            and all(abs(unit_position[(q, unit)] - unit_position[(q, swap)]) == 1 for q in pair)
-        ]
+        key = ukey[swap]
+        head = first[swap]
+        qa, qb = q0[head], q1[head]
+        touching = []
+        for qubit, at in ((qa, pos0[swap]), (qb, pos1[swap])):
+            seq = sequence[qubit]
+            for index in (at - 1, at + 1):
+                if (
+                    0 <= index < len(seq)
+                    and ukey[unit := seq[index]] == key
+                    and abs(place(qa, unit) - pos0[swap]) == 1
+                    and abs(place(qb, unit) - pos1[swap]) == 1
+                ):
+                    touching.append(unit)
         if touching:
             taken.update(touching)
         else:
             pending.append(swap)
     moves = []
     for swap in pending:
-        pair = units[swap][1]
-        # A qubit with no further multi-qubit work would end on the merged block's single-qubit
-        # gates, which an as-late-as-possible schedule leaves idle until the end of the circuit.
-        node = units[swap][0][0]
-        if any(last_multi[q] <= i for q, i in zip(qargs[node], position[node])):
+        head = first[swap]
+        qa, qb = q0[head], q1[head]
+        if last_multi[qa] <= p0[head] or last_multi[qb] <= p1[head]:
             continue
-        qubit = qargs[node][0]
-        seq = sequence[qubit]
+        key = ukey[swap]
+        seq = sequence[qa]
+        labs = seq_lab[qa]
+        size = len(seq)
         for step in (1, -1):
-            index = unit_position[(qubit, swap)] + step
-            # Walk to the nearest unit of the pair, stopping at a unit nothing can be moved past.
-            while (
-                0 <= index < len(seq)
-                and units[seq[index]][1] != pair
-                and units[seq[index]][2][qubit] != "-"
-            ):
+            index = pos0[swap] + step
+            while 0 <= index < size and ukey[seq[index]] != key and labs[index] != "-":
                 index += step
-            unit = seq[index] if 0 <= index < len(seq) else None
+            if not 0 <= index < size:
+                continue
+            unit = seq[index]
             if (
-                unit is not None
-                and units[unit][1] == pair
+                ukey[unit] == key
                 and unit not in taken
-                and all(commutes_between(q, unit, swap) for q in pair)
+                and commutes_between(qa, unit, swap)
+                and commutes_between(qb, unit, swap)
+                and not splits_same_pair_run(unit, step, qa, qb)
             ):
                 taken.add(unit)
                 moves.append((unit, swap, step))
                 break
-    return order, units, moves
+    getall = lambda node: [getq(qubit) for qubit in order[node].qargs]
+    return order, _Members(first, groups, q0, q1, getall), moves
 
 
 def _apply_moves(dag: DAGCircuit, order, units, moves) -> DAGCircuit:
