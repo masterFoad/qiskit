@@ -19,14 +19,16 @@ import math
 import random
 from unittest.mock import patch
 
+import numpy as np
 from ddt import ddt, data
 
-from qiskit.circuit import Barrier, Gate, Parameter, QuantumCircuit
+from qiskit.circuit import Barrier, CommutationChecker, Gate, Parameter, QuantumCircuit
 from qiskit.circuit.library import (
     CPhaseGate,
     CU1Gate,
     CXGate,
     CZGate,
+    HGate,
     QFTGate,
     RYGate,
     RYYGate,
@@ -50,10 +52,26 @@ from qiskit.transpiler.preset_passmanagers.plugin import (
 )
 from qiskit.transpiler.preset_passmanagers._swap_absorption import (
     _AbsorbIntoSwaps,
-    _WIRE_PAULIS,
+    _SUPPORTED_GATES,
     _find_moves,
+    _wire_paulis,
 )
 from test import QiskitTestCase
+
+
+# Finite specification, independent of the shared lookup table. Diagonal gates are functions
+# of Z, X/Y families are functions of their Paulis, and controlled X families have Z-diagonal
+# control projectors and X-like target actions. Pauli-product generators commute with their
+# local factors (RZX is ZX in qargs order). CX-D-CX for diagonal D is a function of Z tensor Z.
+_EXPECTED_WIRE_PAULIS = {
+    **dict.fromkeys(("rz", "z", "s", "sdg", "t", "tdg", "p", "u1"), "Z"),
+    **dict.fromkeys(("rx", "x", "sx", "sxdg"), "X"),
+    **dict.fromkeys(("ry", "y"), "Y"),
+    **dict.fromkeys(("cz", "cp", "crz", "cu1", "cs", "csdg", "rzz"), "ZZ"),
+    **dict.fromkeys(("cx", "crx", "csx", "rzx"), "ZX"),
+    "rxx": "XX",
+    "ryy": "YY",
+}
 
 
 def _run(circuit):
@@ -81,13 +99,13 @@ def _custom_gate(name, definition):
     return gate
 
 
-def _append_standard(circuit, name, qubits):
+def _append_standard(circuit, name, qubits, angle=0.37):
     """Add a gate from the pass's commutation table, including legacy gate classes."""
     if name in ("cu1", "u1"):
-        circuit.append(CU1Gate(0.37) if name == "cu1" else U1Gate(0.37), qubits)
+        circuit.append(CU1Gate(angle) if name == "cu1" else U1Gate(angle), qubits)
     else:
         parameterized = {"p", "rz", "rx", "ry", "cp", "crz", "crx", "rzz", "rxx", "ryy", "rzx"}
-        arguments = (0.37,) if name in parameterized else ()
+        arguments = (angle,) if name in parameterized else ()
         getattr(circuit, name)(*arguments, *qubits)
 
 
@@ -334,6 +352,122 @@ def _spans_overlap(dag):
 class TestAbsorbIntoSwaps(QiskitTestCase):
     """Test the ``_AbsorbIntoSwaps`` pass."""
 
+    def test_standard_wire_labels(self):
+        """All 27 families retain their labels for every angle and local qubit order."""
+        self.assertEqual(_SUPPORTED_GATES, _EXPECTED_WIRE_PAULIS.keys())
+        for name, expected in _EXPECTED_WIRE_PAULIS.items():
+            for angle in (Parameter("theta"), 0, 1e-6, 0.37):
+                for qubits in ((2,),) if len(expected) == 1 else ((0, 2), (2, 0)):
+                    with self.subTest(gate=name, angle=angle, qubits=qubits):
+                        circuit = QuantumCircuit(3)
+                        _append_standard(circuit, name, qubits, angle)
+                        node = next(circuit_to_dag(circuit).topological_op_nodes())
+                        self.assertEqual(_wire_paulis(node), expected)
+
+    def test_unsupported_gates_do_not_query(self):
+        """Identity and allowlist checks precede lookup, including when a cache is populated."""
+        circuit = QuantumCircuit(2)
+        for name, width in (("cx", 2), ("rz", 1), ("cp", 2), ("unitary", 2)):
+            circuit.append(Gate(name, width, []), range(width))
+        circuit.append(HGate(), [0])
+        circuit.append(CXGate(ctrl_state=0), [0, 1])
+        circuit.append(CPhaseGate(0.3, ctrl_state=0), [0, 1])
+        cache = {(name, len(label)): label for name, label in _EXPECTED_WIRE_PAULIS.items()}
+        original_cache = cache.copy()
+        with patch.object(
+            _swap_absorption.SessionCommutationChecker,
+            "check_commutation_entries",
+            side_effect=AssertionError("unsupported gate queried"),
+        ):
+            for node in circuit_to_dag(circuit).topological_op_nodes():
+                self.assertEqual(_wire_paulis(node, cache), "-" * len(node.qargs))
+        self.assertEqual(cache, original_cache)
+
+    def test_missing_or_ambiguous_axes(self):
+        """A missing, negative, or ambiguous rule must conservatively block a wire."""
+        circuit = QuantumCircuit(2)
+        circuit.cp(0.3, 0, 1)
+        node = next(circuit_to_dag(circuit).topological_op_nodes())
+        for result in (None, False, True):
+            with patch.object(
+                _swap_absorption.SessionCommutationChecker,
+                "check_commutation_entries",
+                return_value=result,
+            ) as lookup:
+                self.assertEqual(_wire_paulis(node), "--")
+                self.assertEqual(lookup.call_count, 6)
+
+    def test_exact_unitary_labels_without_lookup(self):
+        """Only exactly diagonal custom unitaries receive ZZ, without table queries."""
+        matrix = np.diag([1, 1j, -1, -1j])
+        almost = matrix.copy()
+        almost[0, 1] = 1e-13
+        with patch.object(
+            _swap_absorption.SessionCommutationChecker,
+            "check_commutation_entries",
+            side_effect=AssertionError("custom unitary queried"),
+        ):
+            for value, label in ((matrix, "ZZ"), (almost, "--")):
+                circuit = QuantumCircuit(2)
+                circuit.append(UnitaryGate(value, check_input=False), [0, 1])
+                node = next(circuit_to_dag(circuit).topological_op_nodes())
+                self.assertEqual(_wire_paulis(node), label)
+
+    def test_small_rotation_crossing(self):
+        """A tiny RY blocks CP while RZ permits a move with the scheduling guard satisfied."""
+        for gate, count in ((RYGate, 0), (RZGate, 1)):
+            circuit = _swap_circuit((gate(1e-6), [0]))
+            circuit.global_phase = 0.123
+            self.assertEqual(len(_find_moves(circuit_to_dag(circuit))[2]), count)
+            out = _run(circuit)
+            if count == 0:
+                self.assertEqual(out, circuit)
+            np.testing.assert_allclose(
+                Operator(out).data, Operator(circuit).data, atol=1e-12, rtol=0
+            )
+
+    def test_lookup_cache_per_run(self):
+        """Only preprocessing queries rules, once per kind and local axis in each run."""
+        circuit = QuantumCircuit(3)
+        circuit.swap(0, 1)
+        for angle in (0, 1e-6, 0.37):
+            for name, label in _EXPECTED_WIRE_PAULIS.items():
+                _append_standard(circuit, name, (2,) if len(label) == 1 else (2, 0), angle)
+        circuit.cx(0, 1)
+        with (
+            patch.object(
+                _swap_absorption.SessionCommutationChecker,
+                "check_commutation_entries",
+                wraps=_swap_absorption.SessionCommutationChecker.check_commutation_entries,
+            ) as lookup,
+            patch.object(
+                CommutationChecker, "commute", side_effect=AssertionError("commute called")
+            ),
+            patch.object(
+                CommutationChecker,
+                "commute_nodes",
+                side_effect=AssertionError("commute_nodes called"),
+            ),
+        ):
+            for _ in range(2):
+                lookup.reset_mock()
+                _run(circuit)
+                self.assertEqual(lookup.call_count, 120)
+                for call in lookup.call_args_list:
+                    op, qargs, _, probe = call.args
+                    self.assertEqual(qargs, tuple(range(op.num_qubits)))
+                    self.assertIn(probe, [(wire,) for wire in qargs])
+            # Exercise range checks along many repeated RZs, with an actual successful move.
+            lookup.reset_mock()
+            crossing = _swap_circuit(*[(RZGate(0.2), [0])] * 100)
+            self.assertEqual(len(_find_moves(circuit_to_dag(crossing))[2]), 1)
+            self.assertEqual(lookup.call_count, 15)  # RZ, CP, CX, independent of range length.
+            lookup.reset_mock()
+            no_swap = QuantumCircuit(2)
+            no_swap.cp(0.3, 0, 1)
+            self.assertEqual(_run(no_swap), no_swap)
+            lookup.assert_not_called()
+
     @data(
         (0, False, False),
         (1, False, False),
@@ -424,7 +558,7 @@ class TestAbsorbIntoSwaps(QiskitTestCase):
         }
         # Every gate of the table is exercised below.
         exercised = {name for names in (*single.values(), *double.values()) for name in names}
-        self.assertEqual(set(_WIRE_PAULIS), exercised)
+        self.assertEqual(_SUPPORTED_GATES, exercised)
 
         for pauli, names in single.items():
             for name in names:
@@ -439,6 +573,9 @@ class TestAbsorbIntoSwaps(QiskitTestCase):
                     qc.cx(1, 2)
                     self.assertEqual(len(_find_moves(circuit_to_dag(qc))[2]), 1)
                     self.assertTrue(Operator(_run(qc)).equiv(Operator(qc)))
+                    np.testing.assert_allclose(
+                        Operator(_run(qc)).data, Operator(qc).data, atol=1e-12, rtol=0
+                    )
 
         for paulis, names in double.items():
             for name in names:
@@ -453,6 +590,9 @@ class TestAbsorbIntoSwaps(QiskitTestCase):
                         qc.cx(1, 2)
                         self.assertEqual(len(_find_moves(circuit_to_dag(qc))[2]), 1)
                         self.assertTrue(Operator(_run(qc)).equiv(Operator(qc)))
+                        np.testing.assert_allclose(
+                            Operator(_run(qc)).data, Operator(qc).data, atol=1e-12, rtol=0
+                        )
 
     def test_moves_next_to_swap(self):
         """An interaction reaches its SWAP through gates it commutes with, exactly."""

@@ -17,21 +17,54 @@ from __future__ import annotations
 import numpy as np
 
 from qiskit.circuit import Qubit
-from qiskit.circuit.library import UnitaryGate
+from qiskit.circuit.commutation_library import SessionCommutationChecker
+from qiskit.circuit.library import CZGate, UnitaryGate, XGate, YGate, ZGate
 from qiskit.dagcircuit import DAGCircuit, DAGOpNode
 from qiskit.transpiler.basepasses import TransformationPass
 
-# For each standard gate, the single-qubit Pauli it commutes with on each of its qubits ("-" for
-# none).  Two operations that, on every qubit they share, commute with the same Pauli commute
-# with each other: both are block diagonal in that Pauli's eigenbasis on the shared qubits.
-_WIRE_PAULIS = {
-    **dict.fromkeys(("rz", "z", "s", "sdg", "t", "tdg", "p", "u1"), "Z"),
-    **dict.fromkeys(("rx", "x", "sx", "sxdg"), "X"),
-    **dict.fromkeys(("ry", "y"), "Y"),
-    **dict.fromkeys(("cz", "cp", "crz", "cu1", "cs", "csdg", "rzz"), "ZZ"),
-    **dict.fromkeys(("cx", "crx", "csx", "rzx"), "ZX"),
-    "rxx": "XX",
-    "ryy": "YY",
+# Keep the admitted gate families explicit: extra table coverage must not enable new moves.
+_SUPPORTED_GATES = frozenset(
+    (
+        "rz",
+        "z",
+        "s",
+        "sdg",
+        "t",
+        "tdg",
+        "p",
+        "u1",
+        "rx",
+        "x",
+        "sx",
+        "sxdg",
+        "ry",
+        "y",
+        "cz",
+        "cp",
+        "crz",
+        "cu1",
+        "cs",
+        "csdg",
+        "rzz",
+        "cx",
+        "crx",
+        "csx",
+        "rzx",
+        "rxx",
+        "ryy",
+    )
+)
+_PAULI_PROBES = (("X", XGate()), ("Y", YGate()), ("Z", ZGate()))
+# Parameter-independent proof representatives, never replacements in the circuit. RX/RY/RZ
+# are functions of their Paulis; P/U1 are functions of Z; CP/CU1 use (I - CZ) / 2.
+_LOOKUP_REPRESENTATIVES = {
+    "rx": XGate(),
+    "ry": YGate(),
+    "rz": ZGate(),
+    "p": ZGate(),
+    "u1": ZGate(),
+    "cp": CZGate(),
+    "cu1": CZGate(),
 }
 
 
@@ -133,15 +166,6 @@ def _find_moves(dag: DAGCircuit):
 
     cache = {}
 
-    def labels(op_node, k):
-        if op_node.is_standard_gate():
-            key = (op_node.name, k)
-            label = cache.get(key)
-            if label is None:
-                label = cache[key] = _WIRE_PAULIS.get(op_node.name, "-" * k)
-            return label
-        return _wire_paulis(op_node)
-
     def next_on(node, a, pa):
         nodes = wires[a]
         return nodes[pa + 1] if pa + 1 < len(nodes) else None
@@ -158,14 +182,14 @@ def _find_moves(dag: DAGCircuit):
         if unit_of[node] >= 0:
             continue
         k = nq[node]
-        label = labels(op_node, k)
+        label = _wire_paulis(op_node, cache)
         unit = len(first)
         if label == "ZX" and op_node.name == "cx" and op_node.is_standard_gate():
             a, b = q0[node], q1[node]
             middle = next_on(node, b, p1[node])
             if (
                 middle is not None
-                and labels(order[middle], nq[middle]) == "Z"
+                and _wire_paulis(order[middle], cache) == "Z"
                 and (last := next_on(middle, b, p0[middle])) is not None
                 and order[last].name == "cx"
                 and order[last].is_standard_gate()
@@ -323,12 +347,45 @@ def _apply_moves(dag: DAGCircuit, order, units, moves) -> DAGCircuit:
     return dag
 
 
-def _wire_paulis(node: DAGOpNode) -> str:
+def _standard_wire_paulis(op, width: int) -> str:
+    """Derive local labels for a verified, allowlisted standard gate using only table rules.
+
+    Two operations commuting with the same local Pauli on every shared wire are block
+    diagonal in those Pauli eigenbases and hence commute exactly. The admitted families
+    are functions of local Paulis, diagonal controlled gates, or Pauli-product rotations.
+    This uses the repaired raw lookup API, never the checker's approximate acceptance paths.
+    """
+    representative = _LOOKUP_REPRESENTATIVES.get(op.name, op)
+    qargs = tuple(range(width))
+    labels = []
+    for wire in range(width):
+        axes = [
+            axis
+            for axis, pauli in _PAULI_PROBES
+            if SessionCommutationChecker.check_commutation_entries(
+                representative, qargs, pauli, (wire,)
+            )
+            is True
+        ]
+        labels.append(axes[0] if len(axes) == 1 else "-")
+    return "".join(labels)
+
+
+def _wire_paulis(node: DAGOpNode, cache: dict | None = None) -> str:
     """The Pauli ``node`` commutes with on each of its qubits, as a string ("-" for none)."""
+    width = len(node.qargs)
     if node.is_standard_gate():
-        return _WIRE_PAULIS.get(node.name, "-" * len(node.qargs))
-    if node.name == "unitary" and len(node.qargs) == 2 and isinstance(node.op, UnitaryGate):
+        if node.name not in _SUPPORTED_GATES:
+            return "-" * width
+        key = (node.name, width)
+        if cache is not None and key in cache:
+            return cache[key]
+        label = _standard_wire_paulis(node.op, width)
+        if cache is not None:
+            cache[key] = label
+        return label
+    if node.name == "unitary" and width == 2 and isinstance(node.op, UnitaryGate):
         matrix = node.op.to_matrix()
         if not np.count_nonzero(matrix - np.diag(np.diagonal(matrix))):
             return "ZZ"
-    return "-" * len(node.qargs)
+    return "-" * width
