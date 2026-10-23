@@ -57,6 +57,12 @@ _SUPPORTED_GATES = frozenset(
 _PAULI_PROBES = (("X", XGate()), ("Y", YGate()), ("Z", ZGate()))
 # Parameter-independent proof representatives, never replacements in the circuit. RX/RY/RZ
 # are functions of their Paulis; P/U1 are functions of Z; CP/CU1 use (I - CZ) / 2.
+# CRZ, CRX, RZZ, RXX, RYY and RZX are looked up under their own names, and the raw lookup
+# ignores their parameters. Their labels hold at every angle, because each gate is a function of
+# the local Paulis in its label: with c = cos(theta / 2) and s = sin(theta / 2), CRZ and CRX are
+# (I + Z) / 2 (x) I + (I - Z) / 2 (x) (c I - i s P) for P = Z or X on the target, and RZZ, RXX,
+# RYY and RZX are c I - i s P for P = ZZ, XX, YY or ZX (Z on the first qubit).
+# test_standard_wire_labels pins the labels at a symbolic angle and at 0, 1e-6 and 0.37.
 _LOOKUP_REPRESENTATIVES = {
     "rx": XGate(),
     "ry": YGate(),
@@ -347,6 +353,11 @@ def _apply_moves(dag: DAGCircuit, order, units, moves) -> DAGCircuit:
     return dag
 
 
+# Labels by (name, width) for the whole process. The session commutation table is built once
+# from the fixed standard library, and the raw lookup reads only names and the placement.
+_WIRE_PAULI_CACHE: dict[tuple[str, int], str] = {}
+
+
 def _standard_wire_paulis(op, width: int) -> str:
     """Derive local labels for a verified, allowlisted standard gate using only table rules.
 
@@ -354,7 +365,11 @@ def _standard_wire_paulis(op, width: int) -> str:
     diagonal in those Pauli eigenbases and hence commute exactly. The admitted families
     are functions of local Paulis, diagonal controlled gates, or Pauli-product rotations.
     This uses the repaired raw lookup API, never the checker's approximate acceptance paths.
+    Each ``(op.name, width)`` is looked up once, then read from ``_WIRE_PAULI_CACHE``.
     """
+    key = (op.name, width)
+    if (label := _WIRE_PAULI_CACHE.get(key)) is not None:
+        return label
     representative = _LOOKUP_REPRESENTATIVES.get(op.name, op)
     qargs = tuple(range(width))
     labels = []
@@ -368,7 +383,8 @@ def _standard_wire_paulis(op, width: int) -> str:
             is True
         ]
         labels.append(axes[0] if len(axes) == 1 else "-")
-    return "".join(labels)
+    label = _WIRE_PAULI_CACHE[key] = "".join(labels)
+    return label
 
 
 def _wire_paulis(node: DAGOpNode, cache: dict | None = None) -> str:

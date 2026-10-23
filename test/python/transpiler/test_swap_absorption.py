@@ -109,6 +109,12 @@ def _append_standard(circuit, name, qubits, angle=0.37):
         getattr(circuit, name)(*arguments, *qubits)
 
 
+def _isolated_label_cache():
+    """Empty the module's label cache for a test that replaces or must exercise the lookup, and
+    restore it afterwards, so labels from a replaced lookup never reach other tests."""
+    return patch.dict(_swap_absorption._WIRE_PAULI_CACHE, clear=True)
+
+
 def _neighbour_on_both_wires(circuit, index, step=1):
     """Index of the nearest instruction after (or before, for ``step=-1``) ``index`` on its
     qubits, if that instruction acts on both of them."""
@@ -362,7 +368,9 @@ class TestAbsorbIntoSwaps(QiskitTestCase):
                         circuit = QuantumCircuit(3)
                         _append_standard(circuit, name, qubits, angle)
                         node = next(circuit_to_dag(circuit).topological_op_nodes())
-                        self.assertEqual(_wire_paulis(node), expected)
+                        # Derive each label again, so every angle is looked up.
+                        with _isolated_label_cache():
+                            self.assertEqual(_wire_paulis(node), expected)
 
     def test_unsupported_gates_do_not_query(self):
         """Identity and allowlist checks precede lookup, including when a cache is populated."""
@@ -374,10 +382,13 @@ class TestAbsorbIntoSwaps(QiskitTestCase):
         circuit.append(CPhaseGate(0.3, ctrl_state=0), [0, 1])
         cache = {(name, len(label)): label for name, label in _EXPECTED_WIRE_PAULIS.items()}
         original_cache = cache.copy()
-        with patch.object(
-            _swap_absorption.SessionCommutationChecker,
-            "check_commutation_entries",
-            side_effect=AssertionError("unsupported gate queried"),
+        with (
+            _isolated_label_cache(),
+            patch.object(
+                _swap_absorption.SessionCommutationChecker,
+                "check_commutation_entries",
+                side_effect=AssertionError("unsupported gate queried"),
+            ),
         ):
             for node in circuit_to_dag(circuit).topological_op_nodes():
                 self.assertEqual(_wire_paulis(node, cache), "-" * len(node.qargs))
@@ -389,11 +400,14 @@ class TestAbsorbIntoSwaps(QiskitTestCase):
         circuit.cp(0.3, 0, 1)
         node = next(circuit_to_dag(circuit).topological_op_nodes())
         for result in (None, False, True):
-            with patch.object(
-                _swap_absorption.SessionCommutationChecker,
-                "check_commutation_entries",
-                return_value=result,
-            ) as lookup:
+            with (
+                _isolated_label_cache(),
+                patch.object(
+                    _swap_absorption.SessionCommutationChecker,
+                    "check_commutation_entries",
+                    return_value=result,
+                ) as lookup,
+            ):
                 self.assertEqual(_wire_paulis(node), "--")
                 self.assertEqual(lookup.call_count, 6)
 
@@ -402,10 +416,13 @@ class TestAbsorbIntoSwaps(QiskitTestCase):
         matrix = np.diag([1, 1j, -1, -1j])
         almost = matrix.copy()
         almost[0, 1] = 1e-13
-        with patch.object(
-            _swap_absorption.SessionCommutationChecker,
-            "check_commutation_entries",
-            side_effect=AssertionError("custom unitary queried"),
+        with (
+            _isolated_label_cache(),
+            patch.object(
+                _swap_absorption.SessionCommutationChecker,
+                "check_commutation_entries",
+                side_effect=AssertionError("custom unitary queried"),
+            ),
         ):
             for value, label in ((matrix, "ZZ"), (almost, "--")):
                 circuit = QuantumCircuit(2)
@@ -426,8 +443,9 @@ class TestAbsorbIntoSwaps(QiskitTestCase):
                 Operator(out).data, Operator(circuit).data, atol=1e-12, rtol=0
             )
 
-    def test_lookup_cache_per_run(self):
-        """Only preprocessing queries rules, once per kind and local axis in each run."""
+    def test_lookup_cache_across_runs(self):
+        """Only preprocessing queries rules, once per kind and local axis, and a second run of the
+        pass reuses the labels without querying again."""
         circuit = QuantumCircuit(3)
         circuit.swap(0, 1)
         for angle in (0, 1e-6, 0.37):
@@ -435,6 +453,7 @@ class TestAbsorbIntoSwaps(QiskitTestCase):
                 _append_standard(circuit, name, (2,) if len(label) == 1 else (2, 0), angle)
         circuit.cx(0, 1)
         with (
+            _isolated_label_cache(),
             patch.object(
                 _swap_absorption.SessionCommutationChecker,
                 "check_commutation_entries",
@@ -449,15 +468,16 @@ class TestAbsorbIntoSwaps(QiskitTestCase):
                 side_effect=AssertionError("commute_nodes called"),
             ),
         ):
-            for _ in range(2):
+            for count in (120, 0):
                 lookup.reset_mock()
                 _run(circuit)
-                self.assertEqual(lookup.call_count, 120)
+                self.assertEqual(lookup.call_count, count)
                 for call in lookup.call_args_list:
                     op, qargs, _, probe = call.args
                     self.assertEqual(qargs, tuple(range(op.num_qubits)))
                     self.assertIn(probe, [(wire,) for wire in qargs])
             # Exercise range checks along many repeated RZs, with an actual successful move.
+            _swap_absorption._WIRE_PAULI_CACHE.clear()
             lookup.reset_mock()
             crossing = _swap_circuit(*[(RZGate(0.2), [0])] * 100)
             self.assertEqual(len(_find_moves(circuit_to_dag(crossing))[2]), 1)

@@ -24,6 +24,7 @@ from qiskit.quantum_info import Operator
 
 from qiskit.circuit import (
     AnnotatedOperation,
+    Clbit,
     CommutationChecker,
     ControlModifier,
     Gate,
@@ -199,6 +200,37 @@ class TestCommutationTableLookup(QiskitTestCase):
                                 checker.check_commutation_entries(
                                     first, first_qargs, second, second_qargs
                                 )
+
+    def test_integer_labels(self):
+        """Integer labels match by value through the index protocol, without a range limit."""
+        pairs = ((np.int64(0), 1), (0, np.uint8(1)), (-1, 2**70), (np.uint64(2**64 - 1), 0))
+        rules = ((ZGate(), 0, True), (ZGate(), 1, False), (XGate(), 1, True))
+        for checker in (scc, get_standard_commutation_checker()):
+            lookup = checker.check_commutation_entries
+            for pair in pairs:
+                ints = tuple(int(label) for label in pair)
+                for gate, wire, expected in rules:
+                    with self.subTest(checker=type(checker), qargs=pair, gate=gate, wire=wire):
+                        self.assertIs(lookup(gate, (ints[wire],), CXGate(), pair), expected)
+                        self.assertIs(lookup(CXGate(), ints, gate, (pair[wire],)), expected)
+            with self.assertRaisesRegex(QiskitError, "first_qargs contains duplicate qubits"):
+                lookup(CXGate(), (np.int64(1), 1), XGate(), (1,))
+
+    def test_non_integer_labels(self):
+        """Booleans, floats and other labels that are neither qubits nor integers are rejected."""
+        for checker in (scc, get_standard_commutation_checker(), CommutationChecker()):
+            for label in (True, False, 1.0, np.float64(0), "0", None, Clbit()):
+                for first_qargs, second_qargs, name in (
+                    ((label,), (0, 1), "first_qargs"),
+                    ((0,), (0, label), "second_qargs"),
+                ):
+                    with self.subTest(checker=type(checker), label=label, name=name):
+                        with self.assertRaisesRegex(
+                            QiskitError, f"{name} must contain qubits or integer labels"
+                        ):
+                            checker.check_commutation_entries(
+                                ZGate(), first_qargs, CXGate(), second_qargs
+                            )
 
     def test_custom_table_and_filter(self):
         """The raw lookup uses canonical names, regardless of semantics and gate filters."""

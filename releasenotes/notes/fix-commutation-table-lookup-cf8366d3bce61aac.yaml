@@ -4,5 +4,8 @@ fixes:
     an ``AttributeError`` instead of querying the configured commutation table. The method
     now returns the stored ``True`` or ``False`` relation, or ``None`` for missing entries
     and disjoint placements. It validates qubit counts and rejects duplicate qubits with
-    :exc:`.QiskitError`. This raw lookup uses operation names and placement without
-    inspecting parameter values, applying the ``gates`` filter, or evaluating matrices.
+    :exc:`.QiskitError`. Qubit labels are :class:`.Qubit` objects or integers, which are
+    converted with :func:`operator.index`, so NumPy integers match equal Python integers;
+    ``bool`` and other values raise :exc:`.QiskitError`. This raw lookup uses operation
+    names and placement without inspecting parameter values, applying the ``gates`` filter,
+    or evaluating matrices.

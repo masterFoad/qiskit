@@ -168,6 +168,10 @@ class CommutationChecker:
         semantics of a standard gate. Likewise, a stored ``False`` for a parameterized
         family does not establish noncommutation at every special parameter value.
 
+        Each qubit label is a :class:`.Qubit` or an integer. Integer labels are converted
+        with :func:`operator.index` and compared by value, so ``numpy.int64(0)`` and ``0``
+        name the same qubit. ``bool`` values are rejected, although they are integers.
+
         Args:
             first_op: first operation.
             first_qargs: first operation's distinct qubits, as qubits or integer labels.
@@ -179,7 +183,8 @@ class CommutationChecker:
             placement. ``None`` if no applicable entry exists or the placements are disjoint.
 
         Raises:
-            QiskitError: If either qubit sequence has the wrong length for its operation
+            QiskitError: If either qubit sequence has the wrong length for its operation,
+                contains a label that is neither a :class:`.Qubit` nor a non-``bool`` integer,
                 or contains duplicate qubits. Qubits shared between the operations are valid.
         """
         return self.cc.check_commutation_entries(
