@@ -320,9 +320,22 @@ original name "rz"  →  use ZGate() for lookup
 original name "cp"  →  use CZGate() for lookup
 ```
 
-This adapter matters because the raw lookup only retrieves stored entries. It does not automatically translate RZ into Z or CP into CZ. The current [standard Rust table](../crates/transpiler/src/standard_gates_commutations.rs) contains entries for `"z"` and `"cz"`, while `"rz"` and `"cp"` have no entries of their own. Without the adapter, raw queries using those original names would return `None` and fail to produce their labels.
+Why is this dictionary needed? The method used here, `check_commutation_entries`, answers a narrow question: **“Does the table contain a commutation answer for these two operation names and their qubit placement?”** It reads a stored answer; it does not calculate one from the gates' matrices or parameters. This is what “raw lookup” means here.
 
-The selection is performed by this line:
+The current [standard Rust table](../crates/transpiler/src/standard_gates_commutations.rs) has rules involving `"z"` and `"cz"`, but none involving `"rz"` or `"cp"`. For example:
+
+| Question passed to the raw lookup | Result | Reason |
+| --- | --- | --- |
+| Does `RZ(0.2)` commute with Z on the same qubit? | `None` | No rule is stored for the names `"rz"` and `"z"`. |
+| Does Z commute with Z on the same qubit? | `True` | The table stores a positive rule for `"z"` and `"z"`. |
+| Does `CP(0.3)` commute with Z on its first qubit? | `None` | No rule is stored for the names `"cp"` and `"z"`. |
+| Does CZ commute with Z on its first qubit? | `True` | The table stores a positive rule for `"cz"` and `"z"`. |
+
+`None` means **“no stored answer,”** so it supplies no proof of commutation. The table itself returns only `True`, `False`, or `None`; the pass builds the labels afterward. It tries the X, Y, and Z probes on each wire and records a letter only when exactly one probe returns `True`. Querying RZ or CP directly would give `None` for all three probes, leaving the pass with `"-"` for RZ or `"--"` for CP.
+
+`_LOOKUP_REPRESENTATIVES` connects these missing families to rules the table does have. For an RZ gate, it makes the pass query Z against the probes; for a CP gate, it makes the pass query CZ. Those queries let the pass derive `"Z"` and `"ZZ"` for the original gates. The mathematical justification for reusing a representative's positive answers is explained below.
+
+This dictionary is the “adapter”: it chooses the gate object passed to the lookup. The original circuit operation stays unchanged. The choice happens here:
 
 ```python
 representative = _LOOKUP_REPRESENTATIVES.get(op.name, op)
