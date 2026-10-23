@@ -371,6 +371,18 @@ The implication is one-way: a positive representative result supplies a family-w
 
 #### Compare the selected operation with the three probes
 
+**`_PAULI_PROBES` lets the pass discover which letter to assign to each wire.** The movement search needs labels such as `Z`, `ZZ`, or `ZX`, but `check_commutation_entries` only answers questions about a pair of operations. It cannot directly answer “what is this gate's label?”
+
+Choosing a representative supplies the first operation in that pair. A **probe** supplies the second: a reference gate used to ask a commutation question. For each wire, the pass tries these three questions:
+
+| Probe | Question asked about the representative | Letter collected if the answer is `True` |
+| --- | --- | --- |
+| `XGate()` | Does it commute with X on this wire? | `"X"` |
+| `YGate()` | Does it commute with Y on this wire? | `"Y"` |
+| `ZGate()` | Does it commute with Z on this wire? | `"Z"` |
+
+If exactly one question returns `True`, its letter becomes the wire's label. Otherwise the code uses `"-"`. The probes are arguments to these queries; they are never inserted into the circuit.
+
 `_PAULI_PROBES` is a tuple of three pairs:
 
 ```python
@@ -384,7 +396,11 @@ Each pair contains two different kinds of object:
 | `"Z"`, a string | The letter to retain if this probe gives the one positive answer for the current qubit. |
 | `ZGate()`, a gate object | The operation passed to the checker to ask the commutation question. |
 
-The same three probes are used for every admitted family. They are not the complete list of supported circuit gates. Their role is to ask three fixed questions about each qubit of the chosen representative.
+X, Y, and Z are the three local Pauli axes used by this pass's movement rule. Testing only Z would miss useful X and Y labels, such as those for RX and RY, and the X label on a CX target. An identity probe would always commute and therefore would not identify an axis. The same three probes are used for every admitted family.
+
+For example, RZ's representative is Z. Probing that representative with X, Y, and Z gives `False`, `False`, and `True`, so the RZ receives `"Z"`. CP's representative is CZ; the probes select Z on each wire, giving the CP `"ZZ"`. If that CP must cross the RZ, their letters match on their only shared wire. This proves the crossing is safe under the rule explained above. In general, the letters must match on **every shared wire**.
+
+This is why the probes are useful to the search: they turn stored pairwise answers into reusable labels. The search can then check runs of matching letters when moving an interaction toward a SWAP, without making a fresh table query for every candidate-and-crossed-gate pair.
 
 The checker receives two operations and the qubits on which each acts:
 
