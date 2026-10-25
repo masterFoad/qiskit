@@ -52,6 +52,7 @@ from qiskit.transpiler.preset_passmanagers.plugin import (
 )
 from qiskit.transpiler.preset_passmanagers._swap_absorption import (
     _AbsorbIntoSwaps,
+    _GainReuse,
     _SUPPORTED_GATES,
     _find_moves,
     _wire_paulis,
@@ -753,6 +754,38 @@ class TestAbsorbIntoSwaps(QiskitTestCase):
         self.assertEqual(len(units[moves[0][1]][1] & units[moves[1][1]][1]), 1)
         self.assertTrue(Operator(_run(qc)).equiv(Operator(qc)))
 
+    def test_gain_evaluation_order_shares_one_reuse_only_within_analysis(self):
+        """Multiple candidates keep their discovery order and share only their own analysis cache."""
+        qc = QuantumCircuit(4)
+        qc.swap(0, 1)
+        qc.rz(0.11, 0)
+        qc.cp(0.23, 0, 1)
+        qc.swap(1, 2)
+        qc.rz(0.17, 1)
+        qc.cp(-0.31, 1, 2)
+        qc.cx(0, 3)
+        qc.cx(1, 3)
+        qc.cx(2, 3)
+        dag = circuit_to_dag(qc)
+        expected = _find_moves(dag)[2]
+        original = _swap_absorption._move_gain
+        observed = []
+
+        def observe(*args):
+            observed.append((args[3], args[5]))
+            return original(*args)
+
+        with patch.object(_swap_absorption, "_move_gain", side_effect=observe):
+            _find_moves(dag, gainful=True)
+            first = list(observed)
+            observed.clear()
+            _find_moves(dag, gainful=True)
+            second = list(observed)
+        self.assertEqual([move for move, _ in first], expected)
+        self.assertTrue(all(reuse is first[0][1] for _, reuse in first))
+        self.assertTrue(all(reuse is second[0][1] for _, reuse in second))
+        self.assertIsNot(first[0][1], second[0][1])
+
     def test_two_opposite_direction_moves(self):
         """One interaction moves forward and another moves backward in the same pass."""
         qc = QuantumCircuit(5)
@@ -819,6 +852,58 @@ class TestAbsorbIntoSwaps(QiskitTestCase):
                 out = _run(qc)
                 self.assertEqual(out == qc, moves == 0)
                 self.assertEqual(Operator.from_circuit(out), Operator.from_circuit(qc))
+
+    def test_gain_reuse_lifts_each_wire_once_and_caches_unknown_cost(self):
+        """One analysis reuses lifts and preserves a cached unknown synthesis result."""
+        reuse = _GainReuse()
+        matrix = np.array([[1, 0], [0, 1j]], dtype=complex)
+        first = reuse.lift(matrix, True)
+        second = reuse.lift(matrix, False)
+        self.assertIs(first, reuse.lift(matrix.copy(), True))
+        np.testing.assert_array_equal(first, np.kron(np.eye(2), matrix))
+        np.testing.assert_array_equal(second, np.kron(matrix, np.eye(2)))
+        with patch.object(_swap_absorption, "two_qubit_cost", return_value=None) as cost:
+            self.assertIsNone(reuse.cost(np.eye(4), False))
+            self.assertIsNone(reuse.cost(np.eye(4), False))
+            self.assertIsNone(reuse.cost(np.eye(4), True))
+        self.assertEqual(cost.call_count, 2)
+
+    def test_custom_matrix_provider_failure_is_not_costed(self):
+        """A custom gate that cannot provide a matrix is conservatively rejected."""
+        circuit = QuantumCircuit(2)
+        gate = _custom_gate("provider_failure", QuantumCircuit(2))
+        circuit.append(gate, [0, 1])
+        node = next(circuit_to_dag(circuit).topological_op_nodes())
+        with patch.object(
+            node.op, "to_matrix", side_effect=RuntimeError("provider failed"), create=True
+        ) as provider:
+            self.assertIsNone(_swap_absorption._matrix(node))
+        provider.assert_called_once()
+
+    def test_cost_provider_exception_propagates(self):
+        """A synthesis-provider error remains visible instead of being converted to no gain."""
+        reuse = _GainReuse()
+        with patch.object(
+            _swap_absorption, "two_qubit_cost", side_effect=RuntimeError("cost failed")
+        ) as cost:
+            with self.assertRaisesRegex(RuntimeError, "cost failed"):
+                reuse.cost(np.eye(4), False)
+            with self.assertRaisesRegex(RuntimeError, "cost failed"):
+                reuse.cost(np.eye(4), False)
+        self.assertEqual(cost.call_count, 2)
+
+    def test_exact_slice_cap_rejects_without_costing(self):
+        """A 256-unit span is rejected before any block cost is requested."""
+        accepted = _swap_circuit(
+            (CZGate(), [0, 2]), *[(RZGate(0.1 + 0.001 * k), [0]) for k in range(253)]
+        )
+        rejected = _swap_circuit(
+            (CZGate(), [0, 2]), *[(RZGate(0.1 + 0.001 * k), [0]) for k in range(254)]
+        )
+        self.assertEqual(len(_find_moves(circuit_to_dag(accepted), gainful=True)[2]), 1)
+        with patch.object(_swap_absorption, "two_qubit_cost") as cost:
+            self.assertEqual(len(_find_moves(circuit_to_dag(rejected), gainful=True)[2]), 0)
+        cost.assert_not_called()
 
     def test_unknown_cost_means_no_move(self):
         """A block whose synthesized count cannot be decided never justifies a move."""
