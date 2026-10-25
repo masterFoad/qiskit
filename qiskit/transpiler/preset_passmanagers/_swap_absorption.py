@@ -24,6 +24,7 @@ from qiskit.circuit.library import CZGate, UnitaryGate, XGate, YGate, ZGate
 from qiskit.dagcircuit import DAGCircuit, DAGOpNode
 from qiskit.transpiler.basepasses import TransformationPass
 from qiskit.transpiler.preset_passmanagers._swap_cost import _SWAP_MAT, _matrix, two_qubit_cost
+from qiskit.transpiler.preset_passmanagers import _swap_sandwich
 
 # Keep the admitted gate families explicit: extra table coverage must not enable new moves.
 _SUPPORTED_GATES = frozenset(
@@ -112,17 +113,27 @@ class _AbsorbIntoSwaps(TransformationPass):
     Args:
         target: used only to cost a continuous ``rzz`` as one two-qubit gate when the target
             supports it.
+        sandwich: after the moves, insert exact cancelling pairs ``g(P, Q)``, ``g(P, Q)`` of
+            CZ-class gates between a run that holds a ``swap`` and the next run on the same pair
+            (the "SWAPs sandwiching a commuting set" case of [1], pp. 7-8, applied after routing;
+            see :mod:`._swap_sandwich`), where the cost predicts a saving of at least 1 per qubit
+            pair.  Off by default.
     """
 
-    def __init__(self, target=None):
+    def __init__(self, target=None, sandwich: bool = False):
         super().__init__()
         self.fractional = target is not None and "rzz" in target.operation_names
+        self.sandwich = bool(sandwich)
 
     def run(self, dag: DAGCircuit) -> DAGCircuit:
         if "swap" not in dag.count_ops(recurse=False):
             return dag
         order, units, moves = _find_moves(dag, gainful=True, fractional=self.fractional)
-        return _apply_moves(dag, order, units, moves) if moves else dag
+        if moves:
+            dag = _apply_moves(dag, order, units, moves)
+        if self.sandwich:
+            dag = _swap_sandwich.insert_swap_sandwiches(dag, fractional=self.fractional)
+        return dag
 
 
 class _Members:

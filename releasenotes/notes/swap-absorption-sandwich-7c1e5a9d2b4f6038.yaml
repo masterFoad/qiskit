@@ -1,0 +1,11 @@
+---
+features_transpiler:
+  - |
+    The pass that moves two-qubit interactions next to routing ``swap`` gates in the translation
+    stage of the preset pass managers has a new opt-in step, off by default.  When enabled, it
+    inserts exact cancelling pairs of CZ-class gates, in one of nine Pauli frames, between a
+    two-qubit block that holds a ``swap`` and the next block on the same qubit pair, when every
+    operation in between commutes with the frame and the optimization stage's two-qubit synthesis
+    is predicted to need fewer two-qubit gates.  This is the "SWAPs sandwiching a commuting set"
+    case of `Liu, Li and Zhou <https://arxiv.org/abs/2205.10596>`__, applied after routing.  The
+    last two-qubit block of a qubit never receives an inserted gate.
