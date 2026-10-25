@@ -52,6 +52,7 @@ from qiskit.transpiler.preset_passmanagers.plugin import (
 )
 from qiskit.transpiler.preset_passmanagers._swap_absorption import (
     _AbsorbIntoSwaps,
+    _GainReuse,
     _SUPPORTED_GATES,
     _find_moves,
     _wire_paulis,
@@ -107,6 +108,12 @@ def _append_standard(circuit, name, qubits, angle=0.37):
         parameterized = {"p", "rz", "rx", "ry", "cp", "crz", "crx", "rzz", "rxx", "ryy", "rzx"}
         arguments = (angle,) if name in parameterized else ()
         getattr(circuit, name)(*arguments, *qubits)
+
+
+def _isolated_label_cache():
+    """Empty the module's label cache for a test that replaces or must exercise the lookup, and
+    restore it afterwards, so labels from a replaced lookup never reach other tests."""
+    return patch.dict(_swap_absorption._WIRE_PAULI_CACHE, clear=True)
 
 
 def _neighbour_on_both_wires(circuit, index, step=1):
@@ -362,7 +369,9 @@ class TestAbsorbIntoSwaps(QiskitTestCase):
                         circuit = QuantumCircuit(3)
                         _append_standard(circuit, name, qubits, angle)
                         node = next(circuit_to_dag(circuit).topological_op_nodes())
-                        self.assertEqual(_wire_paulis(node), expected)
+                        # Derive each label again, so every angle is looked up.
+                        with _isolated_label_cache():
+                            self.assertEqual(_wire_paulis(node), expected)
 
     def test_unsupported_gates_do_not_query(self):
         """Identity and allowlist checks precede lookup, including when a cache is populated."""
@@ -374,10 +383,13 @@ class TestAbsorbIntoSwaps(QiskitTestCase):
         circuit.append(CPhaseGate(0.3, ctrl_state=0), [0, 1])
         cache = {(name, len(label)): label for name, label in _EXPECTED_WIRE_PAULIS.items()}
         original_cache = cache.copy()
-        with patch.object(
-            _swap_absorption.SessionCommutationChecker,
-            "check_commutation_entries",
-            side_effect=AssertionError("unsupported gate queried"),
+        with (
+            _isolated_label_cache(),
+            patch.object(
+                _swap_absorption.SessionCommutationChecker,
+                "check_commutation_entries",
+                side_effect=AssertionError("unsupported gate queried"),
+            ),
         ):
             for node in circuit_to_dag(circuit).topological_op_nodes():
                 self.assertEqual(_wire_paulis(node, cache), "-" * len(node.qargs))
@@ -389,11 +401,14 @@ class TestAbsorbIntoSwaps(QiskitTestCase):
         circuit.cp(0.3, 0, 1)
         node = next(circuit_to_dag(circuit).topological_op_nodes())
         for result in (None, False, True):
-            with patch.object(
-                _swap_absorption.SessionCommutationChecker,
-                "check_commutation_entries",
-                return_value=result,
-            ) as lookup:
+            with (
+                _isolated_label_cache(),
+                patch.object(
+                    _swap_absorption.SessionCommutationChecker,
+                    "check_commutation_entries",
+                    return_value=result,
+                ) as lookup,
+            ):
                 self.assertEqual(_wire_paulis(node), "--")
                 self.assertEqual(lookup.call_count, 6)
 
@@ -402,10 +417,13 @@ class TestAbsorbIntoSwaps(QiskitTestCase):
         matrix = np.diag([1, 1j, -1, -1j])
         almost = matrix.copy()
         almost[0, 1] = 1e-13
-        with patch.object(
-            _swap_absorption.SessionCommutationChecker,
-            "check_commutation_entries",
-            side_effect=AssertionError("custom unitary queried"),
+        with (
+            _isolated_label_cache(),
+            patch.object(
+                _swap_absorption.SessionCommutationChecker,
+                "check_commutation_entries",
+                side_effect=AssertionError("custom unitary queried"),
+            ),
         ):
             for value, label in ((matrix, "ZZ"), (almost, "--")):
                 circuit = QuantumCircuit(2)
@@ -426,8 +444,9 @@ class TestAbsorbIntoSwaps(QiskitTestCase):
                 Operator(out).data, Operator(circuit).data, atol=1e-12, rtol=0
             )
 
-    def test_lookup_cache_per_run(self):
-        """Only preprocessing queries rules, once per kind and local axis in each run."""
+    def test_lookup_cache_across_runs(self):
+        """Only preprocessing queries rules, once per kind and local axis, and a second run of the
+        pass reuses the labels without querying again."""
         circuit = QuantumCircuit(3)
         circuit.swap(0, 1)
         for angle in (0, 1e-6, 0.37):
@@ -435,6 +454,7 @@ class TestAbsorbIntoSwaps(QiskitTestCase):
                 _append_standard(circuit, name, (2,) if len(label) == 1 else (2, 0), angle)
         circuit.cx(0, 1)
         with (
+            _isolated_label_cache(),
             patch.object(
                 _swap_absorption.SessionCommutationChecker,
                 "check_commutation_entries",
@@ -449,15 +469,16 @@ class TestAbsorbIntoSwaps(QiskitTestCase):
                 side_effect=AssertionError("commute_nodes called"),
             ),
         ):
-            for _ in range(2):
+            for count in (120, 0):
                 lookup.reset_mock()
                 _run(circuit)
-                self.assertEqual(lookup.call_count, 120)
+                self.assertEqual(lookup.call_count, count)
                 for call in lookup.call_args_list:
                     op, qargs, _, probe = call.args
                     self.assertEqual(qargs, tuple(range(op.num_qubits)))
                     self.assertIn(probe, [(wire,) for wire in qargs])
             # Exercise range checks along many repeated RZs, with an actual successful move.
+            _swap_absorption._WIRE_PAULI_CACHE.clear()
             lookup.reset_mock()
             crossing = _swap_circuit(*[(RZGate(0.2), [0])] * 100)
             self.assertEqual(len(_find_moves(circuit_to_dag(crossing))[2]), 1)
@@ -612,7 +633,7 @@ class TestAbsorbIntoSwaps(QiskitTestCase):
         unitary.swap(0, 1)
         unitary.p(0.1, 1)
         unitary.cp(0.5, 1, 2)
-        unitary.append(UnitaryGate(Operator.from_label("ZZ").to_matrix() * 1j), [0, 1])
+        unitary.append(UnitaryGate(np.diag([1, 1j, 1j, -1j])), [0, 1])
         unitary.cx(0, 2)
         unitary.cx(2, 1)
         cx_circuit = QuantumCircuit(4)
@@ -733,6 +754,38 @@ class TestAbsorbIntoSwaps(QiskitTestCase):
         self.assertEqual(len(units[moves[0][1]][1] & units[moves[1][1]][1]), 1)
         self.assertTrue(Operator(_run(qc)).equiv(Operator(qc)))
 
+    def test_gain_evaluation_order_shares_one_reuse_only_within_analysis(self):
+        """Multiple candidates keep their discovery order and share only their own analysis cache."""
+        qc = QuantumCircuit(4)
+        qc.swap(0, 1)
+        qc.rz(0.11, 0)
+        qc.cp(0.23, 0, 1)
+        qc.swap(1, 2)
+        qc.rz(0.17, 1)
+        qc.cp(-0.31, 1, 2)
+        qc.cx(0, 3)
+        qc.cx(1, 3)
+        qc.cx(2, 3)
+        dag = circuit_to_dag(qc)
+        expected = _find_moves(dag)[2]
+        original = _swap_absorption._move_gain
+        observed = []
+
+        def observe(*args):
+            observed.append((args[3], args[5]))
+            return original(*args)
+
+        with patch.object(_swap_absorption, "_move_gain", side_effect=observe):
+            _find_moves(dag, gainful=True)
+            first = list(observed)
+            observed.clear()
+            _find_moves(dag, gainful=True)
+            second = list(observed)
+        self.assertEqual([move for move, _ in first], expected)
+        self.assertTrue(all(reuse is first[0][1] for _, reuse in first))
+        self.assertTrue(all(reuse is second[0][1] for _, reuse in second))
+        self.assertIsNot(first[0][1], second[0][1])
+
     def test_two_opposite_direction_moves(self):
         """One interaction moves forward and another moves backward in the same pass."""
         qc = QuantumCircuit(5)
@@ -752,17 +805,155 @@ class TestAbsorbIntoSwaps(QiskitTestCase):
         self.assertTrue(Operator(_run(qc)).equiv(Operator(qc)))
 
     def test_symbolic_controlled_phase(self):
-        """The pass moves symbolic CP without changing its parameter or bound operator."""
+        """A symbolic CP is exactly movable, but its saving cannot be computed, so it stays."""
         theta = Parameter("theta")
         qc = _swap_circuit((RZGate(0.2), [0]), interaction=CPhaseGate(theta))
+        self.assertEqual(len(_find_moves(circuit_to_dag(qc))[2]), 1)
+        self.assertEqual(len(_find_moves(circuit_to_dag(qc), gainful=True)[2]), 0)
+        out = _run(qc)
+        self.assertEqual(out, qc)
+        self.assertEqual(out.parameters, qc.parameters)
+
+    def test_zero_gain_move_is_not_made(self):
+        """A cx already in the SWAP's block (only commuting gates between) is exactly movable, but
+        moving it saves nothing, so the circuit is left as it is."""
+        qc = QuantumCircuit(3)
+        qc.swap(0, 1)
+        qc.rz(0.4, 0)
+        qc.cx(0, 1)
+        qc.cx(0, 2)
+        qc.cx(1, 2)
+        self.assertEqual(len(_find_moves(circuit_to_dag(qc))[2]), 1)
+        self.assertEqual(len(_find_moves(circuit_to_dag(qc), gainful=True)[2]), 0)
+        self.assertEqual(_run(qc), qc)
+
+    def test_gainful_move_is_made(self):
+        """A cx behind a commuting cz on another pair joins the SWAP: 3 + 1 two-qubit gates
+        become 2, and the operator is unchanged including the global phase."""
+        qc = QuantumCircuit(3, global_phase=0.3)
+        qc.swap(0, 1)
+        qc.cz(0, 2)
+        qc.cz(0, 1)
+        qc.cx(0, 2)
+        qc.cx(1, 2)
         out = _run(qc)
         self.assertNotEqual(out, qc)
-        self.assertEqual(out.parameters, qc.parameters)
-        self.assertTrue(
-            Operator(out.assign_parameters({theta: 0.37})).equiv(
-                Operator(qc.assign_parameters({theta: 0.37}))
-            )
+        swap = [inst.name for inst in out.data].index("swap")
+        self.assertEqual(out.data[_neighbour_on_both_wires(out, swap)].name, "cz")
+        self.assertEqual(Operator.from_circuit(out), Operator.from_circuit(qc))
+
+    def test_tiny_interaction_is_not_moved(self):
+        """A controlled phase that the synthesis drops (cost 0) saves nothing next to a SWAP."""
+        for theta, moves in ((1e-5, 0), (1e-13, 0), (0.3, 1)):
+            with self.subTest(theta=theta):
+                qc = _swap_circuit((CZGate(), [0, 2]), interaction=CPhaseGate(theta))
+                self.assertEqual(len(_find_moves(circuit_to_dag(qc))[2]), 1)
+                self.assertEqual(len(_find_moves(circuit_to_dag(qc), gainful=True)[2]), moves)
+                out = _run(qc)
+                self.assertEqual(out == qc, moves == 0)
+                self.assertEqual(Operator.from_circuit(out), Operator.from_circuit(qc))
+
+    def test_gain_reuse_lifts_each_wire_once_and_caches_unknown_cost(self):
+        """One analysis reuses lifts and preserves a cached unknown synthesis result."""
+        reuse = _GainReuse()
+        matrix = np.array([[1, 0], [0, 1j]], dtype=complex)
+        first = reuse.lift(matrix, True)
+        second = reuse.lift(matrix, False)
+        self.assertIs(first, reuse.lift(matrix.copy(), True))
+        np.testing.assert_array_equal(first, np.kron(np.eye(2), matrix))
+        np.testing.assert_array_equal(second, np.kron(matrix, np.eye(2)))
+        with patch.object(_swap_absorption, "two_qubit_cost", return_value=None) as cost:
+            self.assertIsNone(reuse.cost(np.eye(4), False))
+            self.assertIsNone(reuse.cost(np.eye(4), False))
+            self.assertIsNone(reuse.cost(np.eye(4), True))
+        self.assertEqual(cost.call_count, 2)
+
+    def test_custom_matrix_provider_failure_is_not_costed(self):
+        """A custom gate that cannot provide a matrix is conservatively rejected."""
+        circuit = QuantumCircuit(2)
+        gate = _custom_gate("provider_failure", QuantumCircuit(2))
+        circuit.append(gate, [0, 1])
+        node = next(circuit_to_dag(circuit).topological_op_nodes())
+        with patch.object(
+            node.op, "to_matrix", side_effect=RuntimeError("provider failed"), create=True
+        ) as provider:
+            self.assertIsNone(_swap_absorption._matrix(node))
+        provider.assert_called_once()
+
+    def test_cost_provider_exception_propagates(self):
+        """A synthesis-provider error remains visible instead of being converted to no gain."""
+        reuse = _GainReuse()
+        with patch.object(
+            _swap_absorption, "two_qubit_cost", side_effect=RuntimeError("cost failed")
+        ) as cost:
+            with self.assertRaisesRegex(RuntimeError, "cost failed"):
+                reuse.cost(np.eye(4), False)
+            with self.assertRaisesRegex(RuntimeError, "cost failed"):
+                reuse.cost(np.eye(4), False)
+        self.assertEqual(cost.call_count, 2)
+
+    def test_exact_slice_cap_rejects_without_costing(self):
+        """A 256-unit span is rejected before any block cost is requested."""
+        accepted = _swap_circuit(
+            (CZGate(), [0, 2]), *[(RZGate(0.1 + 0.001 * k), [0]) for k in range(253)]
         )
+        rejected = _swap_circuit(
+            (CZGate(), [0, 2]), *[(RZGate(0.1 + 0.001 * k), [0]) for k in range(254)]
+        )
+        self.assertEqual(len(_find_moves(circuit_to_dag(accepted), gainful=True)[2]), 1)
+        with patch.object(_swap_absorption, "two_qubit_cost") as cost:
+            self.assertEqual(len(_find_moves(circuit_to_dag(rejected), gainful=True)[2]), 0)
+        cost.assert_not_called()
+
+    def test_unknown_cost_means_no_move(self):
+        """A block whose synthesized count cannot be decided never justifies a move."""
+        qc = _swap_circuit((CZGate(), [0, 2]))
+        self.assertNotEqual(_run(qc), qc)
+        with patch.object(_swap_absorption, "two_qubit_cost", return_value=None):
+            self.assertEqual(len(_find_moves(circuit_to_dag(qc), gainful=True)[2]), 0)
+            self.assertEqual(_run(qc), qc)
+
+    def test_long_block_means_no_move(self):
+        """A same-pair slice longer than the 256-unit cap is not costed, so no move is made."""
+        between = [(RZGate(0.1 + 0.001 * k), [0]) for k in range(300)]
+        qc = _swap_circuit((CZGate(), [0, 2]), *between)
+        self.assertEqual(len(_find_moves(circuit_to_dag(qc))[2]), 1)
+        self.assertEqual(_run(qc), qc)
+        short = _swap_circuit((CZGate(), [0, 2]), *between[:20])
+        self.assertNotEqual(_run(short), short)
+
+    def test_fractional_target_costs_rzz_as_one_gate(self):
+        """With a native continuous ``rzz`` a ZZ rotation costs one gate, without it two."""
+        qc = _swap_circuit((CZGate(), [0, 2]), interaction=RZZGate(0.3))
+        plain = _AbsorbIntoSwaps(target=_line_target(3))
+        fractional = _AbsorbIntoSwaps(target=_line_target(3, angle_bounded=True))
+        self.assertFalse(plain.fractional)
+        self.assertTrue(fractional.fractional)
+        for pass_ in (plain, fractional):
+            out = dag_to_circuit(pass_.run(circuit_to_dag(qc)))
+            self.assertEqual(Operator.from_circuit(out), Operator.from_circuit(qc))
+
+    def test_layout_semantics_of_equality(self):
+        """How the equality checks treat layouts.  The pass works on the physical circuit and
+        does not touch the layout, which stays in the property set.  So the routed input and the
+        pass output are equal as physical circuits (``Operator``, no permutation undone), and
+        with the routed layout attached to the output, ``Operator.from_circuit`` (which undoes the
+        initial and final permutations) equals the logical input's operator, global phase
+        included."""
+        qc = _phase_and_cx_circuit(5)
+        pm = generate_preset_pass_manager(2, target=_line_target(5), seed_transpiler=7)
+        pm.translation = PassManager([])
+        pm.optimization = PassManager([])
+        routed = pm.run(qc)
+        self.assertIn("swap", routed.count_ops())
+        self.assertIsNotNone(routed.layout)
+        out = _run(routed)
+        self.assertNotEqual(out, routed)
+        self.assertIsNone(out.layout)
+        self.assertEqual(Operator(out), Operator(routed))
+        self.assertEqual(Operator.from_circuit(routed), Operator(qc))
+        out._layout = routed.layout
+        self.assertEqual(Operator.from_circuit(out), Operator(qc))
 
     def test_asymmetric_crz_is_not_moved_across_swap(self):
         """A ``crz`` (which does not commute with SWAP) is moved up to a SWAP, never through one."""

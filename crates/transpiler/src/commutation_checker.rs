@@ -23,11 +23,12 @@ use std::fmt::Debug;
 
 use numpy::PyReadonlyArray2;
 use pyo3::BoundObject;
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::{PyException, PyRuntimeError};
 use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict, PyTuple};
 
+use qiskit_circuit::bit::PyQubit;
 use qiskit_circuit::circuit_instruction::OperationFromPython;
 use qiskit_circuit::dag_node::DAGOpNode;
 use qiskit_circuit::imports::QI_OPERATOR;
@@ -38,6 +39,7 @@ use qiskit_circuit::operations::{
 };
 use qiskit_circuit::{Clbit, Qubit};
 use qiskit_quantum_info::unitary_compose;
+use qiskit_util::py::ImportOnceCell;
 use thiserror::Error;
 
 use crate::QiskitError;
@@ -321,6 +323,43 @@ where
     ))
 }
 
+static OPERATOR_INDEX: ImportOnceCell = ImportOnceCell::new("operator", "index");
+
+/// The qubit labels of one `check_commutation_entries` sequence. A `Qubit` is kept, and an integer
+/// label becomes the exact `int` returned by `operator.index`, so equal Python and NumPy integers
+/// name the same qubit. A `bool` is rejected although it is indexable.
+fn qubit_labels<'py>(qargs: &Bound<'py, PyTuple>, name: &str) -> PyResult<Bound<'py, PyTuple>> {
+    let py = qargs.py();
+    let labels = qargs
+        .iter()
+        .map(|label| {
+            if label.is_instance_of::<PyQubit>() {
+                return Ok(label);
+            }
+            let error = || {
+                QiskitError::new_err(format!(
+                    "{name} must contain qubits or integer labels, got {label:?}"
+                ))
+            };
+            if label.is_instance_of::<PyBool>() {
+                return Err(error());
+            }
+            OPERATOR_INDEX
+                .get_bound(py)
+                .call1((&label,))
+                .map_err(|cause| {
+                    if !cause.is_instance_of::<PyException>(py) {
+                        return cause;
+                    }
+                    let err = error();
+                    err.set_cause(py, Some(cause));
+                    err
+                })
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    PyTuple::new(py, labels)
+}
+
 /// This is the internal structure for the Python CommutationChecker class
 /// It handles the actual commutation checking, and library lookups. It's
 /// not meant to be a public facing Python object though and only used
@@ -345,6 +384,7 @@ impl CommutationChecker {
     }
 
     /// Query only the configured table, without parameter normalization or fallback checks.
+    /// Qubit labels are `Qubit`s or integers accepted by `operator.index`, except `bool`.
     fn check_commutation_entries(
         &self,
         first_op: OperationFromPython<Py<PyAny>>,
@@ -366,7 +406,9 @@ impl CommutationChecker {
                 )));
             }
         }
-        let (first_qargs, second_qargs) = get_bits_from_py::<Qubit>(first_qargs, second_qargs)?;
+        let first_qargs = qubit_labels(first_qargs, "first_qargs")?;
+        let second_qargs = qubit_labels(second_qargs, "second_qargs")?;
+        let (first_qargs, second_qargs) = get_bits_from_py::<Qubit>(&first_qargs, &second_qargs)?;
         // get_relative_placement requires unique arguments for its unchecked map insertion.
         validate_unique_bits(&first_qargs, "first_qargs")?;
         validate_unique_bits(&second_qargs, "second_qargs")?;

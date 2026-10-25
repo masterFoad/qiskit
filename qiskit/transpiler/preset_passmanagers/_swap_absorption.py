@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+from typing import NamedTuple
+
 import numpy as np
 
 from qiskit.circuit import Qubit
@@ -21,6 +23,7 @@ from qiskit.circuit.commutation_library import SessionCommutationChecker
 from qiskit.circuit.library import CZGate, UnitaryGate, XGate, YGate, ZGate
 from qiskit.dagcircuit import DAGCircuit, DAGOpNode
 from qiskit.transpiler.basepasses import TransformationPass
+from qiskit.transpiler.preset_passmanagers._swap_cost import _SWAP_MAT, _matrix, two_qubit_cost
 
 # Keep the admitted gate families explicit: extra table coverage must not enable new moves.
 _SUPPORTED_GATES = frozenset(
@@ -57,6 +60,12 @@ _SUPPORTED_GATES = frozenset(
 _PAULI_PROBES = (("X", XGate()), ("Y", YGate()), ("Z", ZGate()))
 # Parameter-independent proof representatives, never replacements in the circuit. RX/RY/RZ
 # are functions of their Paulis; P/U1 are functions of Z; CP/CU1 use (I - CZ) / 2.
+# CRZ, CRX, RZZ, RXX, RYY and RZX are looked up under their own names, and the raw lookup
+# ignores their parameters. Their labels hold at every angle, because each gate is a function of
+# the local Paulis in its label: with c = cos(theta / 2) and s = sin(theta / 2), CRZ and CRX are
+# (I + Z) / 2 (x) I + (I - Z) / 2 (x) (c I - i s P) for P = Z or X on the target, and RZZ, RXX,
+# RYY and RZX are c I - i s P for P = ZZ, XX, YY or ZX (Z on the first qubit).
+# test_standard_wire_labels pins the labels at a symbolic angle and at 0, 1e-6 and 0.37.
 _LOOKUP_REPRESENTATIVES = {
     "rx": XGate(),
     "ry": YGate(),
@@ -66,6 +75,9 @@ _LOOKUP_REPRESENTATIVES = {
     "cp": CZGate(),
     "cu1": CZGate(),
 }
+# Unit keys of units that are not two-qubit units; a two-qubit unit's pair key is non-negative.
+_SINGLE_QUBIT_UNIT = -2
+_UNSUPPORTED_UNIT = -1
 
 
 class _AbsorbIntoSwaps(TransformationPass):
@@ -90,12 +102,26 @@ class _AbsorbIntoSwaps(TransformationPass):
 
     [2] Lao and Browne. 2QAN: A quantum compiler for 2-local qubit Hamiltonian simulation
     algorithms. `arXiv:2108.02099 <https://arxiv.org/abs/2108.02099>`_
+
+    A move is only made when it is predicted to save at least one two-qubit gate: the summed cost
+    (see :mod:`._swap_cost`) of the same-pair blocks around the ``swap`` and the moved unit before
+    the move, minus their cost after it.  A move whose blocks have an unknown cost, or are longer
+    than 256 units on a wire, is not made: a move that does not lower the two-qubit count can
+    still add single-qubit gates and depth to the resynthesized block.
+
+    Args:
+        target: used only to cost a continuous ``rzz`` as one two-qubit gate when the target
+            supports it.
     """
+
+    def __init__(self, target=None):
+        super().__init__()
+        self.fractional = target is not None and "rzz" in target.operation_names
 
     def run(self, dag: DAGCircuit) -> DAGCircuit:
         if "swap" not in dag.count_ops(recurse=False):
             return dag
-        order, units, moves = _find_moves(dag)
+        order, units, moves = _find_moves(dag, gainful=True, fractional=self.fractional)
         return _apply_moves(dag, order, units, moves) if moves else dag
 
 
@@ -124,7 +150,8 @@ class _Members:
         return (self.groups.get(unit) or [head], qubits)
 
 
-def _find_moves(dag: DAGCircuit):
+def _find_moves(dag: DAGCircuit, gainful: bool = False, fractional: bool = False):
+    """The exact moves of ``dag``, or with ``gainful`` only those with a predicted saving."""
     order = list(dag.topological_op_nodes())
     getq = {qubit: index for index, qubit in enumerate(dag.qubits)}.__getitem__
     num_wires = dag.num_qubits()
@@ -170,8 +197,8 @@ def _find_moves(dag: DAGCircuit):
         nodes = wires[a]
         return nodes[pa + 1] if pa + 1 < len(nodes) else None
 
-    # Units, numbered as in the guard.  ``ukey``: a pair key for two-qubit units, -2 for
-    # single-qubit units, -1 otherwise.
+    # Units, numbered as in the guard.  ``ukey``: a pair key for two-qubit units,
+    # _SINGLE_QUBIT_UNIT for single-qubit units, _UNSUPPORTED_UNIT otherwise.
     unit_of = [-1] * n
     first = []
     groups = {}
@@ -210,7 +237,7 @@ def _find_moves(dag: DAGCircuit):
             if op_node.name == "swap" and op_node.is_standard_gate():
                 swaps.append(unit)
         else:
-            ukey.append(-2 if k == 1 else -1)
+            ukey.append(_SINGLE_QUBIT_UNIT if k == 1 else _UNSUPPORTED_UNIT)
 
     # Per wire: units in order (consecutive repeats merged), their label on the wire, and the
     # start of the run of equal labels each position belongs to.  ``pos0``/``pos1``: position of a
@@ -269,7 +296,7 @@ def _find_moves(dag: DAGCircuit):
         for qubit in (qa, qb):
             seq = sequence[qubit]
             index = place(qubit, unit) + step
-            while 0 <= index < len(seq) and ukey[seq[index]] == -2:
+            while 0 <= index < len(seq) and ukey[seq[index]] == _SINGLE_QUBIT_UNIT:
                 index += step
             neighbours.append(seq[index] if 0 <= index < len(seq) else None)
         return (
@@ -327,7 +354,18 @@ def _find_moves(dag: DAGCircuit):
                 moves.append((unit, swap, step))
                 break
     getall = lambda node: [getq(qubit) for qubit in order[node].qargs]
-    return order, _Members(first, groups, q0, q1, getall), moves
+    units = _Members(first, groups, q0, q1, getall)
+    if gainful:
+        # A dropped move's unit stays taken, so no other SWAP moves it instead.
+        context = _GainContext(sequence, ukey, pos0, pos1, first, q0, q1, nq)
+        reuse = _GainReuse() if moves else None
+        moves = [
+            move
+            for move in moves
+            if (gain := _move_gain(order, units, context, move, fractional, reuse)) is not None
+            and gain >= 1
+        ]
+    return order, units, moves
 
 
 def _apply_moves(dag: DAGCircuit, order, units, moves) -> DAGCircuit:
@@ -347,6 +385,11 @@ def _apply_moves(dag: DAGCircuit, order, units, moves) -> DAGCircuit:
     return dag
 
 
+# Labels by (name, width) for the whole process. The session commutation table is built once
+# from the fixed standard library, and the raw lookup reads only names and the placement.
+_WIRE_PAULI_CACHE: dict[tuple[str, int], str] = {}
+
+
 def _standard_wire_paulis(op, width: int) -> str:
     """Derive local labels for a verified, allowlisted standard gate using only table rules.
 
@@ -354,7 +397,11 @@ def _standard_wire_paulis(op, width: int) -> str:
     diagonal in those Pauli eigenbases and hence commute exactly. The admitted families
     are functions of local Paulis, diagonal controlled gates, or Pauli-product rotations.
     This uses the repaired raw lookup API, never the checker's approximate acceptance paths.
+    Each ``(op.name, width)`` is looked up once, then read from ``_WIRE_PAULI_CACHE``.
     """
+    key = (op.name, width)
+    if (label := _WIRE_PAULI_CACHE.get(key)) is not None:
+        return label
     representative = _LOOKUP_REPRESENTATIVES.get(op.name, op)
     qargs = tuple(range(width))
     labels = []
@@ -368,7 +415,8 @@ def _standard_wire_paulis(op, width: int) -> str:
             is True
         ]
         labels.append(axes[0] if len(axes) == 1 else "-")
-    return "".join(labels)
+    label = _WIRE_PAULI_CACHE[key] = "".join(labels)
+    return label
 
 
 def _wire_paulis(node: DAGOpNode, cache: dict | None = None) -> str:
@@ -389,3 +437,191 @@ def _wire_paulis(node: DAGOpNode, cache: dict | None = None) -> str:
         if not np.count_nonzero(matrix - np.diag(np.diagonal(matrix))):
             return "ZZ"
     return "-" * width
+
+
+# A move whose slice holds more than _MAX_SLICE units on a wire is not costed.  Widening stops at
+# the cap, so a slice takes at most _MAX_SLICE steps per wire, however long its run of soft units.
+_MAX_SLICE = 256
+_NOT_CACHED = object()
+
+
+class _GainContext(NamedTuple):
+    """The :func:`_find_moves` tables that :func:`_move_gain` reads, shared, not copied."""
+
+    sequence: list  # Per wire: its units in order.
+    ukey: list  # Per unit: pair key, _SINGLE_QUBIT_UNIT or _UNSUPPORTED_UNIT.
+    pos0: list  # Per two-qubit unit: position on the wire of its first qubit.
+    pos1: list  # Per two-qubit unit: position on the wire of its second qubit.
+    first: list  # Per unit: its first node.
+    q0: list  # Per node: its first qubit.
+    q1: list  # Per node: its second qubit, or -1.
+    nq: list  # Per node: its number of qubits.
+
+
+class _GainReuse:
+    """Reuse one-qubit lifts and block costs on byte-identical inputs, across the moves of one
+    gainful :func:`_find_moves` call."""
+
+    __slots__ = ("costs", "identity", "lifted")
+
+    def __init__(self):
+        self.identity = np.eye(2)
+        self.lifted = {}
+        self.costs = {}
+
+    def lift(self, matrix, first_wire):
+        """Use the original kron operation on misses, preserving its dtype and values."""
+        key = (first_wire, matrix.shape, matrix.dtype.str, matrix.tobytes())
+        value = self.lifted.get(key)
+        if value is None:
+            value = np.kron(self.identity, matrix) if first_wire else np.kron(matrix, self.identity)
+            self.lifted[key] = value
+        return value
+
+    def cost(self, matrix, fractional):
+        """Cache unknown costs too: an unchanged unknown block must still reject a move."""
+        key = (fractional, matrix.shape, matrix.dtype.str, matrix.tobytes())
+        value = self.costs.get(key, _NOT_CACHED)
+        if value is _NOT_CACHED:
+            value = two_qubit_cost(matrix, fractional)
+            self.costs[key] = value
+        return value
+
+
+def _move_gain(order, units, context, move, fractional, reuse=None):
+    """Predicted two-qubit saving of ``move``.
+
+    On each wire of the pair, the slice from the ``swap`` to the moved unit is widened over
+    same-pair units and parameter-free single-qubit gates up to the next other operation (no
+    same-pair block crosses such an operation).  The slices are cut into blocks (same-pair units
+    joined by single-qubit gates only, on both wires) before and after the move, and the gain is
+    the summed block cost before minus after.  ``None`` when a block cost is unknown or a slice is
+    longer than ``_MAX_SLICE`` units.
+    """
+    unit, swap, step = move
+    head = context.first[swap]
+    qa, qb = context.q0[head], context.q1[head]
+    key = context.ukey[swap]
+    cache = {}
+    if reuse is None:
+        reuse = _GainReuse()
+
+    def matrix(u):
+        if u not in cache:
+            cache[u] = _unit_matrix(order, units, context, u, key, qa, reuse)
+        return cache[u]
+
+    slices = []
+    for qubit in (qa, qb):
+        wire = _widen_slice(context, qubit, swap, unit, key, matrix)
+        if wire is None:
+            return None
+        slices.append(wire)
+    before = _blocks(slices, context.ukey, key, matrix, reuse)
+    after = _blocks(_moved_slices(slices, unit, swap, step), context.ukey, key, matrix, reuse)
+    if before is None or after is None:
+        return None
+    return _cost_difference(before, after, reuse, fractional)
+
+
+def _place(context, qubit, u):
+    """Position of unit ``u`` on the wire of ``qubit``."""
+    return context.pos0[u] if context.q0[context.first[u]] == qubit else context.pos1[u]
+
+
+def _unit_matrix(order, units, context, u, key, qa, reuse):
+    """4x4 matrix of a pair unit on (qa, qb) (qa least significant), or 2x2 of a 1q unit, or
+    ``None`` when a member has no matrix or ``u`` is neither."""
+    if context.ukey[u] == key:
+        mat = np.eye(4, dtype=complex)
+        for member in units[u][0]:
+            m = _matrix(order[member])
+            if m is None:
+                return None
+            if context.nq[member] == 1:
+                m = reuse.lift(m, context.q0[member] == qa)
+            elif context.q0[member] != qa:
+                m = _SWAP_MAT @ m @ _SWAP_MAT
+            mat = m @ mat
+        return mat
+    if context.ukey[u] == _SINGLE_QUBIT_UNIT:
+        members = units[u][0]
+        if len(members) == 1:
+            return _matrix(order[members[0]])
+    return None
+
+
+def _soft(u, ukey, key, matrix):
+    """Whether a slice is widened over unit ``u``: a same-pair unit or a 1q unit with a matrix."""
+    return ukey[u] == key or (ukey[u] == _SINGLE_QUBIT_UNIT and matrix(u) is not None)
+
+
+def _widen_slice(context, qubit, swap, unit, key, matrix):
+    """The units on ``qubit`` from ``swap`` to ``unit``, widened over soft units on both sides,
+    or ``None`` when the slice is longer than ``_MAX_SLICE`` units."""
+    seq = context.sequence[qubit]
+    ukey = context.ukey
+    low, high = sorted((_place(context, qubit, swap), _place(context, qubit, unit)))
+    while low > 0 and high - low < _MAX_SLICE and _soft(seq[low - 1], ukey, key, matrix):
+        low -= 1
+    while (
+        high + 1 < len(seq) and high - low < _MAX_SLICE and _soft(seq[high + 1], ukey, key, matrix)
+    ):
+        high += 1
+    if high - low >= _MAX_SLICE:
+        return None
+    return seq[low : high + 1]
+
+
+def _moved_slices(slices, unit, swap, step):
+    """Fresh copies of ``slices`` with ``unit`` placed right next to ``swap``."""
+    moved = []
+    for wire in slices:
+        wire = [u for u in wire if u != unit]
+        at = wire.index(swap)
+        wire.insert(at + 1 if step > 0 else at, unit)
+        moved.append(wire)
+    return moved
+
+
+def _blocks(slices, ukey, key, matrix, reuse):
+    """Matrices of the same-pair blocks of the two ``slices``, or ``None`` if one is unknown."""
+    wire_a, wire_b = slices
+    index_b = {u: i for i, u in enumerate(wire_b)}
+    index_a = {u: i for i, u in enumerate(wire_a)}
+    pair = [u for u in wire_a if ukey[u] == key and u in index_b]
+    out = []
+    current = None
+    for k, u in enumerate(pair):
+        unit_matrix = matrix(u)
+        if unit_matrix is None:
+            return None
+        if current is not None:
+            prev = pair[k - 1]
+            gap_a = wire_a[index_a[prev] + 1 : index_a[u]]
+            gap_b = wire_b[index_b[prev] + 1 : index_b[u]]
+            if all(ukey[g] == _SINGLE_QUBIT_UNIT and matrix(g) is not None for g in gap_a + gap_b):
+                for g in gap_a:
+                    current = reuse.lift(matrix(g), True) @ current
+                for g in gap_b:
+                    current = reuse.lift(matrix(g), False) @ current
+                current = unit_matrix @ current
+                continue
+            out.append(current)
+        current = unit_matrix
+    if current is not None:
+        out.append(current)
+    return out
+
+
+def _cost_difference(before, after, reuse, fractional):
+    """Summed cost of the ``before`` blocks minus that of the ``after`` blocks, or ``None`` if a
+    cost is unknown."""
+    total = 0
+    for mats, sign in ((before, 1), (after, -1)):
+        for mat in mats:
+            value = reuse.cost(mat, fractional)
+            if value is None:
+                return None
+            total += sign * value
+    return total

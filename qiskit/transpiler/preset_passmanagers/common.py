@@ -492,7 +492,7 @@ def generate_translation_passmanager(
     """
     absorb = []
     if optimization_level in (2, 3):
-        absorb.append(_AbsorbIntoSwaps())
+        absorb.append(_AbsorbIntoSwaps(target=target))
     if basis_gates is None and target is None:
         return PassManager(absorb)
 
