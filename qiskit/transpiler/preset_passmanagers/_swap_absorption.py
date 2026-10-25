@@ -435,16 +435,18 @@ def _wire_paulis(node: DAGOpNode, cache: dict | None = None) -> str:
 
 
 _MAX_SLICE = 256
+_NOT_CACHED = object()
 
 
 class _GainReuse:
     """Reuse one-qubit lifts on byte-identical inputs within one lean analysis."""
 
-    __slots__ = ("identity", "lifted")
+    __slots__ = ("costs", "identity", "lifted")
 
     def __init__(self):
         self.identity = np.eye(2)
         self.lifted = {}
+        self.costs = {}
 
     def lift(self, matrix, first_wire):
         """Use the original kron operation on misses, preserving its dtype and values."""
@@ -453,6 +455,15 @@ class _GainReuse:
         if value is None:
             value = np.kron(self.identity, matrix) if first_wire else np.kron(matrix, self.identity)
             self.lifted[key] = value
+        return value
+
+    def cost(self, matrix, fractional):
+        """Cache unknown costs too: an unchanged unknown block must still reject a move."""
+        key = (fractional, matrix.shape, matrix.dtype.str, matrix.tobytes())
+        value = self.costs.get(key, _NOT_CACHED)
+        if value is _NOT_CACHED:
+            value = two_qubit_cost(matrix, fractional)
+            self.costs[key] = value
         return value
 
 
@@ -558,7 +569,7 @@ def _move_gain(order, units, context, move, fractional, reuse=None):
     total = 0
     for mats, sign in ((before, 1), (after, -1)):
         for mat in mats:
-            value = two_qubit_cost(mat, fractional)
+            value = reuse.cost(mat, fractional)
             if value is None:
                 return None
             total += sign * value
