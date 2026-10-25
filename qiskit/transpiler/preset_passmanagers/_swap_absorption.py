@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import gc
 from typing import NamedTuple
 
 import numpy as np
@@ -128,12 +129,20 @@ class _AbsorbIntoSwaps(TransformationPass):
     def run(self, dag: DAGCircuit) -> DAGCircuit:
         if "swap" not in dag.count_ops(recurse=False):
             return dag
-        order, units, moves = _find_moves(dag, gainful=True, fractional=self.fractional)
-        if moves:
-            dag = _apply_moves(dag, order, units, moves)
-        if self.sandwich:
-            dag = _swap_sandwich.insert_swap_sandwiches(dag, fractional=self.fractional)
-        return dag
+        # The analysis allocates many short-lived containers, and collections triggered by them
+        # dominated the runtime on large circuits.  The previous collector state is restored.
+        gc_was_enabled = gc.isenabled()
+        gc.disable()
+        try:
+            order, units, moves = _find_moves(dag, gainful=True, fractional=self.fractional)
+            if moves:
+                dag = _apply_moves(dag, order, units, moves)
+            if self.sandwich:
+                dag = _swap_sandwich.insert_swap_sandwiches(dag, fractional=self.fractional)
+            return dag
+        finally:
+            if gc_was_enabled:
+                gc.enable()
 
 
 class _Members:
