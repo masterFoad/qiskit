@@ -353,10 +353,11 @@ def _find_moves(dag: DAGCircuit, gainful: bool = False, fractional: bool = False
     if gainful:
         # A dropped move's unit stays taken, so no other SWAP moves it instead.
         context = (sequence, ukey, pos0, pos1, first, q0, q1, nq)
+        reuse = _GainReuse() if moves else None
         moves = [
             move
             for move in moves
-            if (gain := _move_gain(order, units, context, move, fractional)) is not None
+            if (gain := _move_gain(order, units, context, move, fractional, reuse)) is not None
             and gain >= 1
         ]
     return order, units, moves
@@ -436,7 +437,26 @@ def _wire_paulis(node: DAGOpNode, cache: dict | None = None) -> str:
 _MAX_SLICE = 256
 
 
-def _move_gain(order, units, context, move, fractional):
+class _GainReuse:
+    """Reuse one-qubit lifts on byte-identical inputs within one lean analysis."""
+
+    __slots__ = ("identity", "lifted")
+
+    def __init__(self):
+        self.identity = np.eye(2)
+        self.lifted = {}
+
+    def lift(self, matrix, first_wire):
+        """Use the original kron operation on misses, preserving its dtype and values."""
+        key = (first_wire, matrix.shape, matrix.dtype.str, matrix.tobytes())
+        value = self.lifted.get(key)
+        if value is None:
+            value = np.kron(self.identity, matrix) if first_wire else np.kron(matrix, self.identity)
+            self.lifted[key] = value
+        return value
+
+
+def _move_gain(order, units, context, move, fractional, reuse=None):
     """Predicted two-qubit saving of ``move``.
 
     On each wire of the pair, the slice from the ``swap`` to the moved unit is widened over
@@ -452,6 +472,8 @@ def _move_gain(order, units, context, move, fractional):
     qa, qb = q0[head], q1[head]
     key = ukey[swap]
     cache = {}
+    if reuse is None:
+        reuse = _GainReuse()
 
     def place(qubit, u):
         return pos0[u] if q0[first[u]] == qubit else pos1[u]
@@ -469,12 +491,14 @@ def _move_gain(order, units, context, move, fractional):
                         mat = None
                         break
                     if nq[member] == 1:
-                        m = np.kron(np.eye(2), m) if q0[member] == qa else np.kron(m, np.eye(2))
+                        m = reuse.lift(m, q0[member] == qa)
                     elif q0[member] != qa:
                         m = _SWAP_MAT @ m @ _SWAP_MAT
                     mat = m @ mat
-            elif ukey[u] == -2 and len(units[u][0]) == 1:
-                mat = _matrix(order[units[u][0][0]])
+            elif ukey[u] == -2:
+                members = units[u][0]
+                if len(members) == 1:
+                    mat = _matrix(order[members[0]])
             cache[u] = mat
         return cache[u]
 
@@ -501,7 +525,8 @@ def _move_gain(order, units, context, move, fractional):
         out = []
         current = None
         for k, u in enumerate(pair):
-            if matrix(u) is None:
+            unit_matrix = matrix(u)
+            if unit_matrix is None:
                 return None
             if current is not None:
                 prev = pair[k - 1]
@@ -509,13 +534,13 @@ def _move_gain(order, units, context, move, fractional):
                 gap_b = wire_b[index_b[prev] + 1 : index_b[u]]
                 if all(ukey[g] == -2 and matrix(g) is not None for g in gap_a + gap_b):
                     for g in gap_a:
-                        current = np.kron(np.eye(2), matrix(g)) @ current
+                        current = reuse.lift(matrix(g), True) @ current
                     for g in gap_b:
-                        current = np.kron(matrix(g), np.eye(2)) @ current
-                    current = matrix(u) @ current
+                        current = reuse.lift(matrix(g), False) @ current
+                    current = unit_matrix @ current
                     continue
                 out.append(current)
-            current = matrix(u)
+            current = unit_matrix
         if current is not None:
             out.append(current)
         return out
