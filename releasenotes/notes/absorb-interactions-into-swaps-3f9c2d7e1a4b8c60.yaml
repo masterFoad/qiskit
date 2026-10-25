@@ -10,6 +10,8 @@ features_transpiler:
     ``cz`` target.  Moved interactions are standard gates such as ``cx``, ``cz``, ``cp``, ``rzz``
     and ``rxx``, diagonal two-qubit :class:`.UnitaryGate` instances, and ``cx``-``rz``-``cx``
     blocks.  Commutation is decided exactly, and an interaction is never moved across a ``swap``.
+    An interaction is only moved when the merged blocks are predicted to need at least one
+    two-qubit gate fewer, as counted by the optimization stage's two-qubit synthesis.
     This follows the optimization-aware SWAP cost of
     `Liu, Li and Zhou <https://arxiv.org/abs/2205.10596>`__ and the dressed-SWAP synthesis of
     `Lao and Browne <https://arxiv.org/abs/2108.02099>`__.

@@ -632,7 +632,7 @@ class TestAbsorbIntoSwaps(QiskitTestCase):
         unitary.swap(0, 1)
         unitary.p(0.1, 1)
         unitary.cp(0.5, 1, 2)
-        unitary.append(UnitaryGate(Operator.from_label("ZZ").to_matrix() * 1j), [0, 1])
+        unitary.append(UnitaryGate(np.diag([1, 1j, 1j, -1j])), [0, 1])
         unitary.cx(0, 2)
         unitary.cx(2, 1)
         cx_circuit = QuantumCircuit(4)
@@ -772,17 +772,103 @@ class TestAbsorbIntoSwaps(QiskitTestCase):
         self.assertTrue(Operator(_run(qc)).equiv(Operator(qc)))
 
     def test_symbolic_controlled_phase(self):
-        """The pass moves symbolic CP without changing its parameter or bound operator."""
+        """A symbolic CP is exactly movable, but its saving cannot be computed, so it stays."""
         theta = Parameter("theta")
         qc = _swap_circuit((RZGate(0.2), [0]), interaction=CPhaseGate(theta))
+        self.assertEqual(len(_find_moves(circuit_to_dag(qc))[2]), 1)
+        self.assertEqual(len(_find_moves(circuit_to_dag(qc), gainful=True)[2]), 0)
+        out = _run(qc)
+        self.assertEqual(out, qc)
+        self.assertEqual(out.parameters, qc.parameters)
+
+    def test_zero_gain_move_is_not_made(self):
+        """A cx already in the SWAP's block (only commuting gates between) is exactly movable, but
+        moving it saves nothing, so the circuit is left as it is."""
+        qc = QuantumCircuit(3)
+        qc.swap(0, 1)
+        qc.rz(0.4, 0)
+        qc.cx(0, 1)
+        qc.cx(0, 2)
+        qc.cx(1, 2)
+        self.assertEqual(len(_find_moves(circuit_to_dag(qc))[2]), 1)
+        self.assertEqual(len(_find_moves(circuit_to_dag(qc), gainful=True)[2]), 0)
+        self.assertEqual(_run(qc), qc)
+
+    def test_gainful_move_is_made(self):
+        """A cx behind a commuting cz on another pair joins the SWAP: 3 + 1 two-qubit gates
+        become 2, and the operator is unchanged including the global phase."""
+        qc = QuantumCircuit(3, global_phase=0.3)
+        qc.swap(0, 1)
+        qc.cz(0, 2)
+        qc.cz(0, 1)
+        qc.cx(0, 2)
+        qc.cx(1, 2)
         out = _run(qc)
         self.assertNotEqual(out, qc)
-        self.assertEqual(out.parameters, qc.parameters)
-        self.assertTrue(
-            Operator(out.assign_parameters({theta: 0.37})).equiv(
-                Operator(qc.assign_parameters({theta: 0.37}))
-            )
-        )
+        swap = [inst.name for inst in out.data].index("swap")
+        self.assertEqual(out.data[_neighbour_on_both_wires(out, swap)].name, "cz")
+        self.assertEqual(Operator.from_circuit(out), Operator.from_circuit(qc))
+
+    def test_tiny_interaction_is_not_moved(self):
+        """A controlled phase that the synthesis drops (cost 0) saves nothing next to a SWAP."""
+        for theta, moves in ((1e-5, 0), (1e-13, 0), (0.3, 1)):
+            with self.subTest(theta=theta):
+                qc = _swap_circuit((CZGate(), [0, 2]), interaction=CPhaseGate(theta))
+                self.assertEqual(len(_find_moves(circuit_to_dag(qc))[2]), 1)
+                self.assertEqual(len(_find_moves(circuit_to_dag(qc), gainful=True)[2]), moves)
+                out = _run(qc)
+                self.assertEqual(out == qc, moves == 0)
+                self.assertEqual(Operator.from_circuit(out), Operator.from_circuit(qc))
+
+    def test_unknown_cost_means_no_move(self):
+        """A block whose synthesized count cannot be decided never justifies a move."""
+        qc = _swap_circuit((CZGate(), [0, 2]))
+        self.assertNotEqual(_run(qc), qc)
+        with patch.object(_swap_absorption, "two_qubit_cost", return_value=None):
+            self.assertEqual(len(_find_moves(circuit_to_dag(qc), gainful=True)[2]), 0)
+            self.assertEqual(_run(qc), qc)
+
+    def test_long_block_means_no_move(self):
+        """A same-pair slice longer than the 256-unit cap is not costed, so no move is made."""
+        between = [(RZGate(0.1 + 0.001 * k), [0]) for k in range(300)]
+        qc = _swap_circuit((CZGate(), [0, 2]), *between)
+        self.assertEqual(len(_find_moves(circuit_to_dag(qc))[2]), 1)
+        self.assertEqual(_run(qc), qc)
+        short = _swap_circuit((CZGate(), [0, 2]), *between[:20])
+        self.assertNotEqual(_run(short), short)
+
+    def test_fractional_target_costs_rzz_as_one_gate(self):
+        """With a native continuous ``rzz`` a ZZ rotation costs one gate, without it two."""
+        qc = _swap_circuit((CZGate(), [0, 2]), interaction=RZZGate(0.3))
+        plain = _AbsorbIntoSwaps(target=_line_target(3))
+        fractional = _AbsorbIntoSwaps(target=_line_target(3, angle_bounded=True))
+        self.assertFalse(plain.fractional)
+        self.assertTrue(fractional.fractional)
+        for pass_ in (plain, fractional):
+            out = dag_to_circuit(pass_.run(circuit_to_dag(qc)))
+            self.assertEqual(Operator.from_circuit(out), Operator.from_circuit(qc))
+
+    def test_layout_semantics_of_equality(self):
+        """How the equality checks treat layouts.  The pass works on the physical circuit and
+        does not touch the layout, which stays in the property set.  So the routed input and the
+        pass output are equal as physical circuits (``Operator``, no permutation undone), and
+        with the routed layout attached to the output, ``Operator.from_circuit`` (which undoes the
+        initial and final permutations) equals the logical input's operator, global phase
+        included."""
+        qc = _phase_and_cx_circuit(5)
+        pm = generate_preset_pass_manager(2, target=_line_target(5), seed_transpiler=7)
+        pm.translation = PassManager([])
+        pm.optimization = PassManager([])
+        routed = pm.run(qc)
+        self.assertIn("swap", routed.count_ops())
+        self.assertIsNotNone(routed.layout)
+        out = _run(routed)
+        self.assertNotEqual(out, routed)
+        self.assertIsNone(out.layout)
+        self.assertEqual(Operator(out), Operator(routed))
+        self.assertEqual(Operator.from_circuit(routed), Operator(qc))
+        out._layout = routed.layout
+        self.assertEqual(Operator.from_circuit(out), Operator(qc))
 
     def test_asymmetric_crz_is_not_moved_across_swap(self):
         """A ``crz`` (which does not commute with SWAP) is moved up to a SWAP, never through one."""
