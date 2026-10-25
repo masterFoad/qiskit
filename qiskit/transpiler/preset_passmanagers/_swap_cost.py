@@ -62,10 +62,17 @@ def two_qubit_cost(matrix, fractional=False):
 
 def _matrix(node):
     """Numeric matrix of a parameter-free unitary gate, or ``None``."""
+    if node.is_standard_gate():
+        if node.cargs or node.is_parameterized():
+            return None
+        try:
+            return np.asarray(node.matrix, dtype=complex)
+        except Exception:  # pylint: disable=broad-except
+            return None
     op = node.op
     if not isinstance(op, Gate) or node.cargs or node.is_parameterized():
         return None
     try:
-        return np.asarray(node.matrix if node.is_standard_gate() else op.to_matrix(), dtype=complex)
+        return np.asarray(op.to_matrix(), dtype=complex)
     except Exception:  # pylint: disable=broad-except
         return None
