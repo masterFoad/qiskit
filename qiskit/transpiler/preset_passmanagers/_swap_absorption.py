@@ -391,19 +391,17 @@ def _select_moves(nodes: _NodeIndex, units: _UnitIndex, wires: _WireIndex):
         head = units.first_node[swap]
         qubit_a, qubit_b = nodes.first_qubit[head], nodes.second_qubit[head]
         touching = []
-        for qubit, at in (
-            (qubit_a, wires.first_position[swap]),
-            (qubit_b, wires.second_position[swap]),
-        ):
-            sequence = wires.sequences[qubit]
-            for index in (at - 1, at + 1):
-                if (
-                    0 <= index < len(sequence)
-                    and units.pair_keys[unit := sequence[index]] == pair_key
-                    and abs(position_on_wire(qubit_a, unit) - wires.first_position[swap]) == 1
-                    and abs(position_on_wire(qubit_b, unit) - wires.second_position[swap]) == 1
-                ):
-                    touching.append(unit)
+        # A unit next to the SWAP on both wires is a neighbor on the first wire, so scan only
+        # that wire and check the second.
+        sequence = wires.sequences[qubit_a]
+        at = wires.first_position[swap]
+        for index in (at - 1, at + 1):
+            if (
+                0 <= index < len(sequence)
+                and units.pair_keys[unit := sequence[index]] == pair_key
+                and abs(position_on_wire(qubit_b, unit) - wires.second_position[swap]) == 1
+            ):
+                touching.append(unit)
         if touching:
             taken.update(touching)
         else:
