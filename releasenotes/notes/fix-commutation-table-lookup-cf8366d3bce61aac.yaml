@@ -1,0 +1,8 @@
+fixes:
+  - |
+    Fixed :meth:`.CommutationChecker.check_commutation_entries`, which previously raised
+    an ``AttributeError`` instead of querying the configured commutation table. The method
+    now returns the stored ``True`` or ``False`` relation, or ``None`` for missing entries
+    and disjoint placements. It validates qubit counts and rejects duplicate qubits with
+    :exc:`.QiskitError`. This raw lookup uses operation names and placement without
+    inspecting parameter values, applying the ``gates`` filter, or evaluating matrices.

@@ -151,21 +151,37 @@ class CommutationChecker:
     def check_commutation_entries(
         self,
         first_op: Operation,
-        first_qargs: list,
+        first_qargs: Sequence[Qubit | int],
         second_op: Operation,
-        second_qargs: list,
+        second_qargs: Sequence[Qubit | int],
     ) -> bool | None:
-        """Returns stored commutation relation if any
+        """Return a stored commutation relation for the operations' names and placement.
+
+        This is a raw query of the configured table. It does not inspect parameter values,
+        normalize rotations, apply the ``gates`` filter, or use any other commutation checks
+        (including matrix or gate-definition evaluation). A checker with an empty table
+        returns ``None``.
+
+        Operations and their qubits are ordered by ``(num_qubits, len(name), name)`` before
+        lookup. Explicitly supplied tables must use this canonical key order; reversed keys
+        are not searched. Names alone do not establish that a custom operation has the
+        semantics of a standard gate. Likewise, a stored ``False`` for a parameterized
+        family does not establish noncommutation at every special parameter value.
 
         Args:
             first_op: first operation.
-            first_qargs: first operation's qubits.
+            first_qargs: first operation's distinct qubits, as qubits or integer labels.
             second_op: second operation.
-            second_qargs: second operation's qubits.
+            second_qargs: second operation's distinct qubits, as qubits or integer labels.
 
-        Return:
-            bool: True if the gates commute and false if it is not the case.
+        Returns:
+            ``True`` or ``False`` if the table stores that relation for this key and
+            placement. ``None`` if no applicable entry exists or the placements are disjoint.
+
+        Raises:
+            QiskitError: If either qubit sequence has the wrong length for its operation
+                or contains duplicate qubits. Qubits shared between the operations are valid.
         """
-        return self.cc.library.check_commutation_entries(
-            first_op, first_qargs, second_op, second_qargs
+        return self.cc.check_commutation_entries(
+            first_op, tuple(first_qargs), second_op, tuple(second_qargs)
         )

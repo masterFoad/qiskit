@@ -83,6 +83,7 @@ from qiskit.exceptions import QiskitError
 
 from qiskit.quantum_info import SparseObservable, SparsePauliOp, Pauli
 from qiskit._accelerate.standard_generators import _standard_gate_exponent
+from qiskit._accelerate.commutation_checker import get_standard_commutation_checker
 
 ROTATION_GATES = [
     RXGate,
@@ -127,6 +128,99 @@ class MyEvilRXGate(Gate):
 
 
 pauli_based_types = ["pauli", "measure", "evolution", "rotation"]
+
+
+class TestCommutationTableLookup(QiskitTestCase):
+    """The public raw lookup must not invoke the ordinary commutation paths."""
+
+    def test_standard_placements(self):
+        """Canonicalization moves qubit arguments with their operations, including ties."""
+        for checker in (scc, get_standard_commutation_checker()):
+            for bits in ((0, 1, 2), tuple(QuantumCircuit(3).qubits)):
+                a, b, c = bits
+                for first, qargs, second, other, expected in (
+                    (ZGate(), (a,), XGate(), (a,), False),
+                    (XGate(), (b,), CXGate(), (a, b), True),
+                    (XGate(), (a,), CXGate(), (a, b), False),
+                    (ZGate(), (a,), CXGate(), (a, b), True),
+                    (ZGate(), (b,), CXGate(), (a, b), False),
+                    (CXGate(), (a, b), CXGate(), (a, c), True),
+                    (CXGate(), (a, b), CXGate(), (b, a), False),
+                    (CXGate(), (a, b), CRZGate(0.2), (a, c), True),
+                    (CXGate(), (a, b), CRZGate(0.2), (b, c), False),
+                ):
+                    with self.subTest(checker=type(checker), first=first, qargs=qargs, other=other):
+                        lookup = checker.check_commutation_entries
+                        self.assertIs(lookup(first, qargs, second, other), expected)
+                        self.assertIs(lookup(second, other, first, qargs), expected)
+                        if checker is scc:
+                            self.assertIs(lookup(first, list(qargs), second, list(other)), expected)
+
+    def test_missing_and_disjoint(self):
+        """Missing entries and disjoint placements return None, even for compressed rules."""
+        for checker in (scc, get_standard_commutation_checker(), CommutationChecker()):
+            self.assertIsNone(checker.check_commutation_entries(XGate(), (0,), ZGate(), (1,)))
+            self.assertIsNone(
+                checker.check_commutation_entries(Gate("unknown", 1, []), (0,), XGate(), (0,))
+            )
+        self.assertIsNone(
+            CommutationChecker().check_commutation_entries(XGate(), [0], XGate(), [0])
+        )
+
+    def test_no_fallback(self):
+        """Neither the matrix nor the definition of an unknown operation is evaluated."""
+
+        class OpaqueGate(Gate):
+            def __init__(self):
+                super().__init__("opaque", 1, [])
+
+            def to_matrix(self):
+                raise AssertionError("matrix evaluated")
+
+            @Gate.definition.getter
+            def definition(self):
+                raise AssertionError("definition evaluated")
+
+        for first, second in ((OpaqueGate(), XGate()), (XGate(), OpaqueGate())):
+            self.assertIsNone(scc.check_commutation_entries(first, [0], second, [0]))
+
+    def test_invalid_qubits(self):
+        """Wrong widths and duplicate qubits are rejected before calculating placement."""
+        for checker in (scc, get_standard_commutation_checker(), CommutationChecker()):
+            for bits in ((0, 1, 2), tuple(QuantumCircuit(3).qubits)):
+                a, b, c = bits
+                for qargs in ((), (a,), (a, b, c), (a, a)):
+                    for first, first_qargs, second, second_qargs in (
+                        (CXGate(), qargs, XGate(), (c,)),
+                        (XGate(), (c,), CXGate(), qargs),
+                    ):
+                        with self.subTest(checker=type(checker), qargs=qargs):
+                            with self.assertRaises(QiskitError):
+                                checker.check_commutation_entries(
+                                    first, first_qargs, second, second_qargs
+                                )
+
+    def test_custom_table_and_filter(self):
+        """The raw lookup uses canonical names, regardless of semantics and gate filters."""
+        table = {("a", "bb"): {(0,): True, (1,): False}}
+        checker = CommutationChecker(table, gates={"unrelated"})
+        first, second = Gate("a", 1, []), Gate("bb", 2, [])
+        for wire, expected in ((0, True), (1, False), (2, None)):
+            self.assertIs(
+                checker.check_commutation_entries(second, [0, 1], first, [wire]), expected
+            )
+        reversed_table = CommutationChecker({("bb", "a"): True})
+        self.assertIsNone(reversed_table.check_commutation_entries(first, [0], second, [0, 1]))
+        # A standard-looking name is deliberately not a semantic guarantee in this raw API.
+        self.assertIs(scc.check_commutation_entries(Gate("x", 1, []), [0], ZGate(), [0]), False)
+
+    def test_no_rotation_normalization(self):
+        """Zero, tiny, and symbolic angles all retrieve the same stored family relation."""
+        checker = CommutationChecker({("x", "ry"): False, ("x", "y"): True})
+        for angle in (0, 1e-6, 0.37, Parameter("theta")):
+            self.assertIs(
+                checker.check_commutation_entries(RYGate(angle), [0], XGate(), [0]), False
+            )
 
 
 @ddt
