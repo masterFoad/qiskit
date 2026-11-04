@@ -1,0 +1,15 @@
+---
+features_transpiler:
+  - |
+    At ``optimization_level`` 2 and 3, the preset pass managers now move a two-qubit gate next to
+    a ``swap`` on the same qubits when the gate commutes with every operation in between.
+    :class:`.TwoQubitPeepholeOptimization` can then synthesize the two as one block; a ``swap``
+    and a ``cx`` on the same qubits need two two-qubit gates instead of four.
+  - |
+    Added an ``optimization_level`` argument to :func:`.generate_translation_passmanager`. When it
+    is 2 or 3, the translation stage starts with the step that moves two-qubit gates next to
+    ``swap`` gates. The default, ``None``, leaves the translation stage unchanged.
+upgrade_transpiler:
+  - |
+    The output of :func:`.transpile` at ``optimization_level`` 2 and 3 can change for circuits
+    that contain a ``swap`` after routing.
