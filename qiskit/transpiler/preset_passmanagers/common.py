@@ -16,10 +16,13 @@
 from __future__ import annotations
 
 import collections
+import functools
 import typing
 
+from qiskit.circuit import QuantumCircuit
 from qiskit.circuit.equivalence_library import SessionEquivalenceLibrary as sel
 from qiskit.circuit.controlflow import CONTROL_FLOW_OP_NAMES
+from qiskit.converters import circuit_to_dag
 
 from qiskit.passmanager.flow_controllers import ConditionalController
 from qiskit.transpiler.passmanager import PassManager
@@ -51,6 +54,7 @@ from qiskit.transpiler.passes import VF2PostLayout
 from qiskit.transpiler.passes.layout.vf2_layout import VF2LayoutStopReason
 from qiskit.transpiler.passes.layout.vf2_post_layout import VF2PostLayoutStopReason
 from qiskit.transpiler.passes import WrapAngles
+from qiskit.transpiler.preset_passmanagers._swap_absorption import _AbsorbIntoSwaps
 from qiskit.transpiler.exceptions import TranspilerError
 from qiskit.transpiler.layout import Layout
 from qiskit.transpiler.optimization_metric import OptimizationMetric
@@ -448,6 +452,7 @@ def generate_translation_passmanager(
     unitary_synthesis_plugin_config: dict | None = None,
     hls_config: HLSConfig | None = None,
     qubits_initially_zero: bool = True,
+    optimization_level: int | None = None,
 ):
     """Generate a basis translation :class:`~qiskit.transpiler.PassManager`
 
@@ -476,6 +481,13 @@ def generate_translation_passmanager(
             Specifies how to synthesize various high-level objects.
         qubits_initially_zero: Indicates whether the input circuit is
             zero-initialized.
+        optimization_level: At 2 or 3, the stage starts by moving two-qubit gates next to
+            ``swap`` gates on the same qubits, unless ``swap`` is native to ``target`` (or to
+            ``basis_gates`` if there is no target) or there are no basis gates. Diagonal gates
+            are not moved when ``rzz`` is native, or when ``cx`` and ``p`` gates cannot be
+            translated to the basis gates. ``None`` (the default) leaves the stage
+            unchanged. Translation plugins that build their stage with this function can pass
+            their optimization level to include this step.
 
     Returns:
         PassManager: The basis translation pass manager
@@ -483,6 +495,14 @@ def generate_translation_passmanager(
     Raises:
         TranspilerError: If the ``method`` kwarg is not a valid value
     """
+    # The move pays off only when a swap costs three two-qubit gates, so not when the swap is
+    # native or there are no basis gates at all.
+    native = target.operation_names if target is not None else basis_gates or ()
+    absorb = []
+    if optimization_level in (2, 3) and native and "swap" not in native:
+        # A swap and a diagonal gate are written with cx and p gates.
+        move_diagonal = "rzz" not in native and _translates_cx_and_p(frozenset(native))
+        absorb.append(_AbsorbIntoSwaps(move_diagonal=move_diagonal))
     if basis_gates is None and target is None:
         return PassManager([])
 
@@ -591,7 +611,24 @@ def generate_translation_passmanager(
         )
     if target is not None and target.has_angle_bounds():
         unroll.append(WrapAngles(target))
-    return PassManager(unroll)
+    return PassManager(absorb + unroll)
+
+
+@functools.lru_cache(maxsize=64)
+def _translates_cx_and_p(basis: frozenset) -> bool:
+    """Whether :class:`.BasisTranslator` can write ``cx`` and ``p`` gates in ``basis``.
+
+    The session equivalence library only grows, so a cached ``True`` stays correct, and a
+    stale ``False`` only means that diagonal gates are not moved.
+    """
+    circuit = QuantumCircuit(2)
+    circuit.cx(0, 1)
+    circuit.p(1.0, 0)
+    try:
+        BasisTranslator(sel, basis).run(circuit_to_dag(circuit))
+    except TranspilerError:
+        return False
+    return True
 
 
 def generate_scheduling(instruction_durations, scheduling_method, timing_constraints, target=None):
