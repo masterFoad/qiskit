@@ -130,6 +130,96 @@ pauli_based_types = ["pauli", "measure", "evolution", "rotation"]
 
 
 @ddt
+class TestCommutationTableLookup(QiskitTestCase):
+    """Test ``CommutationChecker.check_commutation_entries``, the raw table lookup."""
+
+    @data(
+        (ZGate(), (0,), XGate(), (0,), False),
+        (XGate(), (1,), CXGate(), (0, 1), True),
+        (ZGate(), (0,), CXGate(), (0, 1), True),
+        (ZGate(), (1,), CXGate(), (0, 1), False),
+        (CXGate(), (0, 1), CXGate(), (0, 2), True),
+        (CXGate(), (0, 1), CXGate(), (1, 0), False),
+        (CXGate(), (0, 1), CRZGate(0.2), (1, 2), False),
+    )
+    @unpack
+    def test_standard_entries(self, first, first_qargs, second, second_qargs, expected):
+        """The stored relation is found in either argument order."""
+        self.assertIs(
+            scc.check_commutation_entries(first, first_qargs, second, second_qargs), expected
+        )
+        self.assertIs(
+            scc.check_commutation_entries(second, second_qargs, first, first_qargs), expected
+        )
+
+    def test_qubit_objects(self):
+        """Qubit objects give the same result as integer labels."""
+        a, b = QuantumCircuit(2).qubits
+        self.assertIs(scc.check_commutation_entries(XGate(), [b], CXGate(), [a, b]), True)
+        self.assertIs(scc.check_commutation_entries(XGate(), [a], CXGate(), [a, b]), False)
+
+    def test_missing_and_disjoint(self):
+        """Unknown operations and disjoint qubits return ``None``."""
+        self.assertIsNone(scc.check_commutation_entries(XGate(), (0,), ZGate(), (1,)))
+        self.assertIsNone(
+            scc.check_commutation_entries(Gate("unknown", 1, []), (0,), XGate(), (0,))
+        )
+        self.assertIsNone(
+            CommutationChecker().check_commutation_entries(XGate(), [0], XGate(), [0])
+        )
+
+    def test_no_fallback(self):
+        """Neither the matrix nor the definition of an unknown operation is used."""
+
+        class OpaqueGate(Gate):
+            def __init__(self):
+                super().__init__("opaque", 1, [])
+
+            def to_matrix(self):
+                raise AssertionError("matrix evaluated")
+
+            @Gate.definition.getter
+            def definition(self):
+                raise AssertionError("definition evaluated")
+
+        self.assertIsNone(scc.check_commutation_entries(OpaqueGate(), [0], XGate(), [0]))
+
+    @data((), (0,), (0, 1, 2), (0, 0))
+    def test_invalid_qubits(self, qargs):
+        """Wrong numbers of qubits and duplicate qubits raise an error in either argument."""
+        with self.assertRaises(QiskitError):
+            scc.check_commutation_entries(CXGate(), qargs, XGate(), (2,))
+        with self.assertRaises(QiskitError):
+            scc.check_commutation_entries(XGate(), (2,), CXGate(), qargs)
+
+    def test_custom_table(self):
+        """A custom table is used by name only, without the ``gates`` filter or parameters."""
+        checker = CommutationChecker({("a", "bb"): {(0,): True, (1,): False}}, gates={"other"})
+        first, second = Gate("a", 1, []), Gate("bb", 2, [])
+        self.assertIs(checker.check_commutation_entries(second, [0, 1], first, [0]), True)
+        self.assertIs(checker.check_commutation_entries(second, [0, 1], first, [1]), False)
+        reversed_table = CommutationChecker({("bb", "a"): True})
+        self.assertIsNone(reversed_table.check_commutation_entries(first, [0], second, [0, 1]))
+        rotation = CommutationChecker({("x", "ry"): False})
+        for angle in (0, 1e-6, Parameter("theta")):
+            with self.subTest(angle=angle):
+                found = rotation.check_commutation_entries(RYGate(angle), [0], XGate(), [0])
+                self.assertIs(found, False)
+
+    def test_non_ascii_names(self):
+        """Names are ordered by their length in UTF-8 bytes, as in ``commute``."""
+        # One character but two bytes, so it is ordered after "ab".
+        accent, plain = Gate("\u00e9", 1, []), Gate("ab", 1, [])
+        checker = CommutationChecker({("ab", "\u00e9"): True})
+        self.assertIs(checker.check_commutation_entries(accent, [0], plain, [0]), True)
+        self.assertIs(checker.check_commutation_entries(plain, [0], accent, [0]), True)
+        self.assertTrue(checker.commute(accent, [0], [], plain, [0], []))
+        reversed_table = CommutationChecker({("\u00e9", "ab"): True})
+        self.assertIsNone(reversed_table.check_commutation_entries(accent, [0], plain, [0]))
+        self.assertFalse(reversed_table.commute(accent, [0], [], plain, [0], []))
+
+
+@ddt
 class TestCommutationChecker(QiskitTestCase):
     """Test CommutationChecker class."""
 
