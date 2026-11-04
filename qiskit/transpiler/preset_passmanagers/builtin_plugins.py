@@ -221,6 +221,7 @@ class BasisTranslatorPassManager(PassManagerStagePlugin):
             unitary_synthesis_plugin_config=pass_manager_config.unitary_synthesis_plugin_config,
             hls_config=pass_manager_config.hls_config,
             qubits_initially_zero=pass_manager_config.qubits_initially_zero,
+            optimization_level=optimization_level,
         )
 
 
@@ -238,6 +239,7 @@ class UnitarySynthesisPassManager(PassManagerStagePlugin):
             unitary_synthesis_plugin_config=pass_manager_config.unitary_synthesis_plugin_config,
             hls_config=pass_manager_config.hls_config,
             qubits_initially_zero=pass_manager_config.qubits_initially_zero,
+            optimization_level=optimization_level,
         )
 
 
