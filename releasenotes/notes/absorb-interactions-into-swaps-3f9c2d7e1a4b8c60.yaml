@@ -1,9 +1,14 @@
 ---
 features_transpiler:
   - |
-    At ``optimization_level`` 2 and 3, the translation stage now first moves a two-qubit gate
-    next to a routing ``swap`` on the same qubits when it commutes with the gates in between, so
-    that the pair needs fewer two-qubit gates: a ``swap`` and a ``cx`` become two ``cx`` gates, and
-    a ``swap`` and a diagonal gate such as ``cz`` or ``cp`` become three. A gate is moved only if
-    the target supports the result. Diagonal gates are not moved on targets with ``rzz``, and
-    nothing is moved on targets with a native ``swap``.
+    Added the opt-in translation plugins ``absorb_swaps`` and ``absorb_swaps_synthesis``, for
+    example ``generate_preset_pass_manager(2, target=target, translation_method="absorb_swaps")``.  At
+    ``optimization_level`` 2 and 3, they first move a two-qubit gate next to a routing ``swap`` on
+    the same qubits when it commutes with the gates in between, so that the pair needs fewer
+    two-qubit gates: a ``swap`` and a ``cx`` become two ``cx`` gates, and a ``swap`` and a diagonal
+    gate such as ``cz`` or ``cp`` become three.  They then run the ``translator`` or ``synthesis``
+    plugin respectively.  A gate is moved only if the target supports the result.  Diagonal gates
+    are not moved on targets with ``rzz``, and nothing is moved on targets with a native ``swap``.
+    As with an explicit ``translation_method="translator"`` or ``"synthesis"``, Clifford+T basis
+    sets are not supported.  The built-in ``default``, ``translator`` and ``synthesis`` plugins
+    are unchanged.

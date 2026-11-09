@@ -211,7 +211,7 @@ class BasisTranslatorPassManager(PassManagerStagePlugin):
     """Plugin class for translation stage with :class:`~.BasisTranslator`"""
 
     def pass_manager(self, pass_manager_config, optimization_level=None) -> PassManager:
-        translation = common.generate_translation_passmanager(
+        return common.generate_translation_passmanager(
             pass_manager_config.target,
             basis_gates=pass_manager_config.basis_gates,
             method="translator",
@@ -222,14 +222,13 @@ class BasisTranslatorPassManager(PassManagerStagePlugin):
             hls_config=pass_manager_config.hls_config,
             qubits_initially_zero=pass_manager_config.qubits_initially_zero,
         )
-        return common._with_swap_absorption(translation, pass_manager_config, optimization_level)
 
 
 class UnitarySynthesisPassManager(PassManagerStagePlugin):
     """Plugin class for translation stage with :class:`~.UnitarySynthesis`"""
 
     def pass_manager(self, pass_manager_config, optimization_level=None) -> PassManager:
-        translation = common.generate_translation_passmanager(
+        return common.generate_translation_passmanager(
             pass_manager_config.target,
             basis_gates=pass_manager_config.basis_gates,
             method="synthesis",
@@ -239,6 +238,39 @@ class UnitarySynthesisPassManager(PassManagerStagePlugin):
             unitary_synthesis_plugin_config=pass_manager_config.unitary_synthesis_plugin_config,
             hls_config=pass_manager_config.hls_config,
             qubits_initially_zero=pass_manager_config.qubits_initially_zero,
+        )
+
+
+class SwapAbsorptionTranslationPassManager(PassManagerStagePlugin):
+    """Plugin class for the opt-in ``absorb_swaps`` translation stage.
+
+    This is the ``translator`` stage, started at levels 2 and 3 by moving two-qubit gates next to
+    routing ``swap`` gates where that needs fewer two-qubit gates.
+
+    As with an explicit ``translation_method="translator"``, Clifford+T basis sets are not
+    supported.
+    """
+
+    def pass_manager(self, pass_manager_config, optimization_level=None) -> PassManager:
+        translation = BasisTranslatorPassManager().pass_manager(
+            pass_manager_config, optimization_level
+        )
+        return common._with_swap_absorption(translation, pass_manager_config, optimization_level)
+
+
+class SwapAbsorptionSynthesisPassManager(PassManagerStagePlugin):
+    """Plugin class for the opt-in ``absorb_swaps_synthesis`` translation stage.
+
+    This is the ``synthesis`` stage, started at levels 2 and 3 by moving two-qubit gates next to
+    routing ``swap`` gates where that needs fewer two-qubit gates.
+
+    As with an explicit ``translation_method="synthesis"``, Clifford+T basis sets are not
+    supported.
+    """
+
+    def pass_manager(self, pass_manager_config, optimization_level=None) -> PassManager:
+        translation = UnitarySynthesisPassManager().pass_manager(
+            pass_manager_config, optimization_level
         )
         return common._with_swap_absorption(translation, pass_manager_config, optimization_level)
 

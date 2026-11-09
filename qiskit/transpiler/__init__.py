@@ -735,6 +735,12 @@ When writing :ref:`stage plugins <transpiler-preset-stage-plugins>`, the entry p
       - Collect each run of one- and two-qubit gates into a matrix representation, and resynthesize
         from there.
 
+    * - :ref:`absorb_swaps <transpiler-preset-stage-translation-absorb-swaps>`
+      - ``translator``, first moving two-qubit gates next to routing ``swap`` gates (opt-in).
+
+    * - :ref:`absorb_swaps_synthesis <transpiler-preset-stage-translation-absorb-swaps>`
+      - ``synthesis``, first moving two-qubit gates next to routing ``swap`` gates (opt-in).
+
 .. _transpiler-preset-stage-translation-default:
 
 Built-in ``default`` plugin
@@ -777,6 +783,22 @@ towards the ISA.
 This is the default translation method.
 
 The optimization level has no effect on this plugin.
+
+
+.. _transpiler-preset-stage-translation-absorb-swaps:
+
+Built-in ``absorb_swaps`` and ``absorb_swaps_synthesis`` plugins
+.................................................................
+
+At optimization levels 2 and 3, these plugins first move a two-qubit gate next to a routing ``swap``
+on the same qubits when it commutes with the gates in between, so that the pair needs fewer
+two-qubit gates, and then run the :ref:`translator <transpiler-preset-stage-translation-translator>`
+or :ref:`synthesis <transpiler-preset-stage-translation-synthesis>` plugin respectively.  A gate is
+moved only if the target supports the result.  Nothing is moved on targets with a native ``swap``,
+without basis gates, or with non-default synthesis options (``unitary_synthesis_method``,
+``unitary_synthesis_plugin_config`` or ``hls_config``).  At other optimization levels these plugins
+are the same as ``translator`` and ``synthesis``.  Like the other translation plugins, the chosen
+plugin is also used for the translation in the optimization loop.
 
 
 .. _transpiler-preset-stage-optimization:

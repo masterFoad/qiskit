@@ -15,11 +15,12 @@
 import itertools
 import random
 from unittest.mock import patch
+from test import QiskitTestCase
 
 import numpy as np
 from ddt import ddt, data, idata, unpack
 
-from qiskit.circuit import Gate, Parameter, QuantumCircuit
+from qiskit.circuit import Gate, IfElseOp, Parameter, QuantumCircuit
 from qiskit.circuit.equivalence_library import SessionEquivalenceLibrary
 from qiskit.circuit.library import CPhaseGate, CU1Gate, CXGate, CZGate, PhaseGate, QFTGate, RXGate
 from qiskit.circuit.library import ECRGate, RXXGate, RZGate, SwapGate, SXGate, XGate, ZGate
@@ -27,13 +28,15 @@ from qiskit.circuit.library import qaoa_ansatz
 from qiskit.converters import circuit_to_dag
 from qiskit.exceptions import QiskitError
 from qiskit.quantum_info import Operator, SparsePauliOp
+from qiskit.passmanager import BaseController
+from qiskit.passmanager.flow_controllers import DoWhileController
 from qiskit.transpiler import CouplingMap, PassManagerConfig, Target, generate_preset_pass_manager
 from qiskit.transpiler.basepasses import AnalysisPass
 from qiskit.transpiler.passes import CheckGateDirection, CheckMap, HLSConfig
 from qiskit.transpiler.preset_passmanagers.plugin import PassManagerStagePluginManager
+from qiskit.transpiler.preset_passmanagers.plugin import list_stage_plugins
 from qiskit.transpiler.preset_passmanagers import _swap_absorption
 from qiskit.transpiler.preset_passmanagers._swap_absorption import _AbsorbIntoSwaps
-from test import QiskitTestCase
 
 
 def _circuit(num_qubits, gates, num_clbits=0, physical=True):
@@ -70,6 +73,17 @@ _NEAR_DIAG = _DIAG + np.diag([1e-13, 0, 0], 1)  # one off-diagonal entry of 1e-1
 _CUSTOM_RZ = _custom_gate("rz", 1, [("h", 0)])
 _CUSTOM_SWAP = _custom_gate("swap", 2, [("cx", 0, 1)])
 _RZ_BODY = _circuit(1, [("rz", 0.2, 0)], num_clbits=1, physical=False)
+_BUILTIN = ["default", "translator", "synthesis"]
+_OPT_IN = ["absorb_swaps", "absorb_swaps_synthesis"]
+
+
+def _pass_types(task, in_loop=False):
+    """Yield ``(type name, in a do-while loop)`` for every pass in ``task``, recursively."""
+    if isinstance(task, BaseController):
+        for child in task.tasks:
+            yield from _pass_types(child, in_loop or isinstance(task, DoWhileController))
+    else:
+        yield type(task).__name__, in_loop
 
 
 @ddt
@@ -393,10 +407,10 @@ class TestAbsorbIntoSwaps(QiskitTestCase):
 class TestAbsorbIntoSwapsPresets(QiskitTestCase):
     """Test the pass in the preset pass managers, on circuits of at most 6 qubits."""
 
-    @idata(itertools.product([None, 0, 1, 2, 3], ["default", "translator", "synthesis"]))
+    @idata(itertools.product([None, 0, 1, 2, 3], _BUILTIN + _OPT_IN))
     @unpack
     def test_translation_plugins(self, level, method):
-        """The built-in translation plugins add the pass at levels 2 and 3 only."""
+        """Only the opt-in translation plugins add the pass, at levels 2 and 3 only."""
         qc = QuantumCircuit(2)
         qc.swap(0, 1)
         passes = []
@@ -407,7 +421,7 @@ class TestAbsorbIntoSwapsPresets(QiskitTestCase):
             optimization_level=level,
         )
         pm.run(qc, callback=lambda **kwargs: passes.append(type(kwargs["pass_"]).__name__))
-        self.assertEqual("_AbsorbIntoSwaps" in passes, level in (2, 3))
+        self.assertEqual("_AbsorbIntoSwaps" in passes, method in _OPT_IN and level in (2, 3))
 
     @data(
         (None, _BASIS, True, []),
@@ -429,19 +443,21 @@ class TestAbsorbIntoSwapsPresets(QiskitTestCase):
     )
     @unpack
     def test_translation_passmanager(self, level, basis, with_target, expected, options=None):
-        """The translation stage adds the pass by level, native gates and plugin options."""
+        """The opt-in translation stages add the pass by level, native gates and plugin options."""
         target = _line_target(2, basis) if with_target else None
         qc = QuantumCircuit(2)
         qc.swap(0, 1)
         basis_gates = None if with_target else basis
         config = PassManagerConfig(target=target, basis_gates=basis_gates, **(options or {}))
-        passes = []
-        pm = PassManagerStagePluginManager().get_passmanager_stage(
-            "translation", "default", config, optimization_level=level
-        )
-        pm.run(qc, callback=lambda **kwargs: passes.append(kwargs["pass_"]))
-        found = [pass_.move_diagonal for pass_ in passes if isinstance(pass_, _AbsorbIntoSwaps)]
-        self.assertEqual(found, expected)
+        for method in _BUILTIN + _OPT_IN:
+            with self.subTest(method=method):
+                passes = []
+                pm = PassManagerStagePluginManager().get_passmanager_stage(
+                    "translation", method, config, optimization_level=level
+                )
+                pm.run(qc, callback=lambda passes=passes, **kwargs: passes.append(kwargs["pass_"]))
+                found = [p.move_diagonal for p in passes if isinstance(p, _AbsorbIntoSwaps)]
+                self.assertEqual(found, expected if method in _OPT_IN else [])
 
     @idata(
         itertools.product(
@@ -463,6 +479,7 @@ class TestAbsorbIntoSwapsPresets(QiskitTestCase):
         """Assert that the check rejects the moves and the output equals that without the pass."""
         options = {"target": target, "seed_transpiler": 1, "routing_method": "none"}
         options["initial_layout"] = list(range(qc.num_qubits))
+        options["translation_method"] = "absorb_swaps"
         checks = []
         supported = _AbsorbIntoSwaps._supported
 
@@ -526,9 +543,10 @@ class TestAbsorbIntoSwapsPresets(QiskitTestCase):
         qc = _circuit(3, [("swap", 0, 1), ("z", 0), ("cx", 0, 1), ("cx", 1, 2), ("cx", 0, 1)])
         plugins = PassManagerStagePluginManager()
 
-        out = plugins.get_passmanager_stage("translation", "default", config, level).run(qc)
+        method = "absorb_swaps"
+        out = plugins.get_passmanager_stage("translation", method, config, level).run(qc)
         with patch.object(_AbsorbIntoSwaps, "run", lambda self, dag: dag):
-            control = plugins.get_passmanager_stage("translation", "default", config, level).run(qc)
+            control = plugins.get_passmanager_stage("translation", method, config, level).run(qc)
 
         def two_qubit_gates(circuit):
             return sum(instruction.operation.num_qubits == 2 for instruction in circuit.data)
@@ -578,6 +596,7 @@ class TestAbsorbIntoSwapsPresets(QiskitTestCase):
         qc = qaoa_ansatz(cost, reps=1).assign_parameters([0.4, 0.9])
         target = _line_target(5)
         options = {"target": target, "seed_transpiler": 7, **options}
+        options["translation_method"] = "absorb_swaps"
 
         out = generate_preset_pass_manager(level, **options).run(qc)
         with patch.object(_AbsorbIntoSwaps, "run", lambda self, dag: dag):
@@ -606,7 +625,9 @@ class TestAbsorbIntoSwapsPresets(QiskitTestCase):
         qc = QuantumCircuit(6)
         qc.append(QFTGate(6), range(6))
         counts = []
-        pm = generate_preset_pass_manager(level, seed_transpiler=1, **options)
+        has_routing = "target" in options or "coupling_map" in options
+        options = {"seed_transpiler": 1, "translation_method": "absorb_swaps", **options}
+        pm = generate_preset_pass_manager(level, **options)
 
         def callback(pass_, dag, **_):
             counts.append((type(pass_).__name__, dag.count_ops().get("swap", 0)))
@@ -616,5 +637,51 @@ class TestAbsorbIntoSwapsPresets(QiskitTestCase):
         index = [name for name, _ in counts].index("_AbsorbIntoSwaps")
         # Without a coupling map there are no routing SWAPs to absorb.
         absorbed = counts[index][1] < counts[index - 1][1]
-        self.assertEqual(absorbed, options.keys() != {"basis_gates"})
+        self.assertEqual(absorbed, has_routing)
         self.assertEqual(Operator.from_circuit(out), Operator.from_circuit(qc))
+
+    @idata(itertools.product([0, 1, 2, 3], [None, *_BUILTIN, *_OPT_IN]))
+    @unpack
+    def test_preset_pass_managers(self, level, method):
+        """Only the opt-in plugins add the pass, to translation and to the optimization loop."""
+        pm = generate_preset_pass_manager(level, target=_line_target(4), translation_method=method)
+        passes = _pass_types(pm.to_flow_controller())
+        found = {in_loop for name, in_loop in passes if name == "_AbsorbIntoSwaps"}
+        self.assertEqual(found, {False, True} if method in _OPT_IN and level in (2, 3) else set())
+
+    @idata(itertools.product([0, 1], zip(_OPT_IN, ["translator", "synthesis"])))
+    @unpack
+    def test_low_levels(self, level, methods):
+        """At levels 0 and 1 the opt-in plugins give the output of the plugins they extend."""
+        qc = QuantumCircuit(5)
+        qc.append(QFTGate(5), range(5))
+        outs = [
+            generate_preset_pass_manager(
+                level, target=_line_target(5), seed_transpiler=3, translation_method=method
+            ).run(qc)
+            for method in methods
+        ]
+        self.assertEqual(outs[0], outs[1])
+        self.assertEqual(outs[0].layout, outs[1].layout)
+
+    def test_plugins_are_listed(self):
+        """The opt-in plugins are registered translation plugins."""
+        self.assertLessEqual({*_BUILTIN, *_OPT_IN}, set(list_stage_plugins("translation")))
+
+    @idata(itertools.product([2, 3], _OPT_IN))
+    @unpack
+    def test_control_flow(self, level, method):
+        """The opt-in plugins can be used on circuits with control flow."""
+        target = _line_target(3, [*_BASIS, "measure"])
+        target.add_instruction(IfElseOp, name="if_else")
+        qc = QuantumCircuit(3, 1)
+        qc.h(0)
+        qc.measure(0, 0)
+        qc.if_test((qc.clbits[0], 1), _RZ_BODY, [0], [0])
+        qc.cp(0.3, 0, 2)
+        qc.cx(1, 2)
+        pm = generate_preset_pass_manager(
+            level, target=target, seed_transpiler=1, translation_method=method
+        )
+        out = pm.run(qc)
+        self.assertIn("if_else", out.count_ops())

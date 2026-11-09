@@ -161,6 +161,8 @@ default = "qiskit.transpiler.preset_passmanagers.builtin_plugins:DefaultInitPass
 default = "qiskit.transpiler.preset_passmanagers.builtin_plugins:DefaultTranslationPassManager"
 synthesis = "qiskit.transpiler.preset_passmanagers.builtin_plugins:UnitarySynthesisPassManager"
 translator = "qiskit.transpiler.preset_passmanagers.builtin_plugins:BasisTranslatorPassManager"
+absorb_swaps = "qiskit.transpiler.preset_passmanagers.builtin_plugins:SwapAbsorptionTranslationPassManager"
+absorb_swaps_synthesis = "qiskit.transpiler.preset_passmanagers.builtin_plugins:SwapAbsorptionSynthesisPassManager"
 
 [project.entry-points."qiskit.transpiler.routing"]
 default = "qiskit.transpiler.preset_passmanagers.builtin_plugins:DefaultRoutingPassManager"
