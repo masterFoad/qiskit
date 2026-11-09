@@ -35,6 +35,7 @@ from qiskit.transpiler.passes import CheckMap
 from qiskit.transpiler.passes import GateDirection
 from qiskit.transpiler.passes import BarrierBeforeFinalMeasurements
 from qiskit.transpiler.passes import CheckGateDirection
+from qiskit.transpiler.passes import TwoQubitPeepholeOptimization
 from qiskit.transpiler.passes import TimeUnitConversion
 from qiskit.transpiler.passes import ALAPScheduleAnalysis
 from qiskit.transpiler.passes import ASAPScheduleAnalysis
@@ -51,6 +52,7 @@ from qiskit.transpiler.passes import VF2PostLayout
 from qiskit.transpiler.passes.layout.vf2_layout import VF2LayoutStopReason
 from qiskit.transpiler.passes.layout.vf2_post_layout import VF2PostLayoutStopReason
 from qiskit.transpiler.passes import WrapAngles
+from qiskit.transpiler.preset_passmanagers._swap_absorption import _AbsorbIntoSwaps
 from qiskit.transpiler.exceptions import TranspilerError
 from qiskit.transpiler.layout import Layout
 from qiskit.transpiler.optimization_metric import OptimizationMetric
@@ -592,6 +594,42 @@ def generate_translation_passmanager(
     if target is not None and target.has_angle_bounds():
         unroll.append(WrapAngles(target))
     return PassManager(unroll)
+
+
+def _with_swap_absorption(translation, pass_manager_config, optimization_level):
+    """Start a built-in translation stage by moving two-qubit gates next to ``swap`` gates.
+
+    This is done at levels 2 and 3 only, if ``translation`` turns all the moved gates into
+    supported instructions.  The step is skipped when ``swap`` is native or there are no basis
+    gates, and with synthesis plugin options, since checking the moves reruns ``translation``.
+    """
+    target = pass_manager_config.target
+    basis_gates = pass_manager_config.basis_gates
+    operation_names = target.operation_names if target is not None else basis_gates
+    default_synthesis = (
+        pass_manager_config.unitary_synthesis_method == "default"
+        and pass_manager_config.unitary_synthesis_plugin_config is None
+        and pass_manager_config.hls_config is None
+    )
+    if (
+        optimization_level not in (2, 3)
+        or not operation_names
+        or "swap" in operation_names
+        or not default_synthesis
+    ):
+        return translation
+    unroll = list(translation.to_flow_controller().tasks)
+    synthesis = []
+    if target is not None:
+        synthesis = [TwoQubitPeepholeOptimization(target, pass_manager_config.approximation_degree)]
+    absorb = _AbsorbIntoSwaps(
+        move_diagonal="rzz" not in operation_names,
+        target=target,
+        basis_gates=basis_gates,
+        check=unroll,
+        synthesis=synthesis,
+    )
+    return PassManager([absorb, *unroll])
 
 
 def generate_scheduling(instruction_durations, scheduling_method, timing_constraints, target=None):

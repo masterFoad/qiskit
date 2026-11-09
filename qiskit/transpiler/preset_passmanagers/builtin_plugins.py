@@ -211,7 +211,7 @@ class BasisTranslatorPassManager(PassManagerStagePlugin):
     """Plugin class for translation stage with :class:`~.BasisTranslator`"""
 
     def pass_manager(self, pass_manager_config, optimization_level=None) -> PassManager:
-        return common.generate_translation_passmanager(
+        translation = common.generate_translation_passmanager(
             pass_manager_config.target,
             basis_gates=pass_manager_config.basis_gates,
             method="translator",
@@ -222,13 +222,14 @@ class BasisTranslatorPassManager(PassManagerStagePlugin):
             hls_config=pass_manager_config.hls_config,
             qubits_initially_zero=pass_manager_config.qubits_initially_zero,
         )
+        return common._with_swap_absorption(translation, pass_manager_config, optimization_level)
 
 
 class UnitarySynthesisPassManager(PassManagerStagePlugin):
     """Plugin class for translation stage with :class:`~.UnitarySynthesis`"""
 
     def pass_manager(self, pass_manager_config, optimization_level=None) -> PassManager:
-        return common.generate_translation_passmanager(
+        translation = common.generate_translation_passmanager(
             pass_manager_config.target,
             basis_gates=pass_manager_config.basis_gates,
             method="synthesis",
@@ -239,6 +240,7 @@ class UnitarySynthesisPassManager(PassManagerStagePlugin):
             hls_config=pass_manager_config.hls_config,
             qubits_initially_zero=pass_manager_config.qubits_initially_zero,
         )
+        return common._with_swap_absorption(translation, pass_manager_config, optimization_level)
 
 
 class DefaultRoutingPassManager(PassManagerStagePlugin):

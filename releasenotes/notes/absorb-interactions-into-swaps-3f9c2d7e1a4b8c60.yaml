@@ -1,0 +1,9 @@
+---
+features_transpiler:
+  - |
+    At ``optimization_level`` 2 and 3, the translation stage now first moves a two-qubit gate
+    next to a routing ``swap`` on the same qubits when it commutes with the gates in between, so
+    that the pair needs fewer two-qubit gates: a ``swap`` and a ``cx`` become two ``cx`` gates, and
+    a ``swap`` and a diagonal gate such as ``cz`` or ``cp`` become three. A gate is moved only if
+    the target supports the result. Diagonal gates are not moved on targets with ``rzz``, and
+    nothing is moved on targets with a native ``swap``.
