@@ -18,10 +18,16 @@ from __future__ import annotations
 import collections
 import typing
 
+from qiskit.circuit import Parameter
 from qiskit.circuit.equivalence_library import SessionEquivalenceLibrary as sel
 from qiskit.circuit.controlflow import CONTROL_FLOW_OP_NAMES
+from qiskit.circuit.library.standard_gates import get_standard_gate_name_mapping
 
+from qiskit.converters import circuit_to_dag, dag_to_circuit
 from qiskit.passmanager.flow_controllers import ConditionalController
+from qiskit.synthesis.one_qubit.one_qubit_decompose import ONE_QUBIT_EULER_BASIS_GATES
+from qiskit.transpiler.basepasses import TransformationPass
+from qiskit.transpiler.preset_passmanagers._block_pairs import _ResynthesizeBlockPairs
 from qiskit.transpiler.passmanager import PassManager
 from qiskit.transpiler.passes import Error
 from qiskit.transpiler.passes import BasisTranslator
@@ -64,6 +70,89 @@ if typing.TYPE_CHECKING:
     from qiskit.transpiler.coupling import CouplingMap
 
 _ControlFlowState = collections.namedtuple("_ControlFlowState", ("working", "not_working"))
+
+
+class _BlockPairReplay(TransformationPass):
+    """Replay a stage in a fresh PassManager, including its frontend and loop state."""
+
+    def __init__(self, tasks):
+        super().__init__()
+        self._manager = PassManager(tasks)
+
+    def run(self, dag):
+        # The second loop needs its own MinimumPoint state, separate from the first loop's
+        # property-set entries. A nested run keeps the replay identical to the measured arm;
+        # its inner passes are not reported to the outer manager's user callback.
+        return circuit_to_dag(self._manager.run(dag_to_circuit(dag)))
+
+
+def _generate_block_pair_post_optimization(translation, optimization, pass_manager_config):
+    """Paired resynthesis, translation and a fresh optimization loop after stock optimization."""
+    target = pass_manager_config.target
+    if (
+        (pass_manager_config.optimization_method or "default") != "default"
+        or pass_manager_config.unitary_synthesis_method != "default"
+        or (pass_manager_config.translation_method or "default")
+        not in {"default", "translator", "synthesis"}
+        # The pass certifies an exact decomposition, not an approximate synthesis policy.
+        or pass_manager_config.approximation_degree not in (None, 1.0)
+    ):
+        return None
+    if target is None:
+        names = pass_manager_config.basis_gates
+        standard = get_standard_gate_name_mapping()
+        if not names or any(name not in standard for name in names):
+            return None
+        operations = {name: standard[name] for name in names}
+        two_qubit = {name for name in names if standard[name].num_qubits == 2}
+    else:
+        operations = {name: target.operation_from_name(name) for name in target.operation_names}
+        two_qubit = {
+            name
+            for name, operation in operations.items()
+            if getattr(operation, "num_qubits", None) == 2
+        }
+    if not two_qubit or not two_qubit <= {"cx", "cz", "ecr"}:
+        return None
+    # An Euler basis needs freely parameterized rotations, not fixed-angle names or restricted
+    # angle ranges. Check each physical qubit rather than the target's aggregate operation names.
+    one_qubit = {
+        name
+        for name, operation in operations.items()
+        if getattr(operation, "num_qubits", None) == 1
+        and all(isinstance(parameter, Parameter) for parameter in operation.params)
+        and (target is None or not target.gate_has_angle_bounds(name))
+    }
+    local_bases = (
+        (
+            {name for name in one_qubit if target.instruction_supported(name, (qubit,))}
+            for qubit in range(target.num_qubits)
+        )
+        if target is not None and target.num_qubits is not None
+        else (one_qubit,)
+    )
+    if not all(
+        any(set(gates) <= basis for gates in ONE_QUBIT_EULER_BASIS_GATES.values())
+        for basis in local_bases
+    ):
+        return None
+    # Match the post arm's direct-task filter.  The original stage owns post-layout mapping;
+    # its conditional ApplyLayout controller is retained, as in the harness.
+    loop = [
+        task
+        for task in optimization.to_flow_controller().tasks
+        if not isinstance(task, (VF2PostLayout, ApplyLayout))
+    ]
+    # Capture both task lists now. Later replacement of the preset's translation or optimization
+    # stage is not seen by this replay.
+    return PassManager(
+        [
+            _ResynthesizeBlockPairs(target=target),
+            _BlockPairReplay(translation.to_flow_controller().tasks),
+            _BlockPairReplay(loop),
+        ]
+    )
+
 
 # Any method neither known good nor known bad (i.e. not a Terra-internal pass) is passed through
 # without error, since it is being supplied by a plugin and we don't have any knowledge of these.

@@ -1,0 +1,11 @@
+---
+features_transpiler:
+  - |
+    At ``optimization_level`` 2 and 3, the preset pass managers now resynthesize pairs of
+    two-qubit blocks on the same qubits across gates that commute with a two-qubit Clifford.
+    This paired resynthesis runs after optimization, followed by translation and another
+    optimization loop. It is enabled with the default optimization and unitary synthesis methods,
+    a built-in translation method, and a target that supports exact arbitrary single-qubit gates
+    and uses only ``cx``, ``cz`` or ``ecr`` as its two-qubit basis gates. Explicit approximation
+    settings other than ``None`` or ``1.0`` disable it. This changes level-2 and level-3 output
+    circuits and transpilation time.

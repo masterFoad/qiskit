@@ -105,5 +105,8 @@ def level_2_pass_manager(pass_manager_config: PassManagerConfig) -> StagedPassMa
         routing=routing,
         translation=translation,
         optimization=optimization,
+        post_optimization=common._generate_block_pair_post_optimization(
+            translation, optimization, pass_manager_config
+        ),
         scheduling=sched,
     )
