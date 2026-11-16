@@ -1,0 +1,5 @@
+---
+fixes:
+  - |
+    Fixed :meth:`.CommutationChecker.check_commutation_entries`, which raised an
+    ``AttributeError`` instead of looking up the commutation table.

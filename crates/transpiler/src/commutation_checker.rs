@@ -344,6 +344,48 @@ impl CommutationChecker {
         CommutationChecker::new(Some(library), gates)
     }
 
+    /// Query only the configured table, without parameter normalization or fallback checks.
+    fn check_commutation_entries(
+        &self,
+        first_op: OperationFromPython<Py<PyAny>>,
+        first_qargs: &Bound<'_, PyTuple>,
+        second_op: OperationFromPython<Py<PyAny>>,
+        second_qargs: &Bound<'_, PyTuple>,
+    ) -> PyResult<Option<bool>> {
+        let first_op = first_op.operation.view();
+        let second_op = second_op.operation.view();
+        for (op, qargs, name) in [
+            (&first_op, first_qargs, "first_qargs"),
+            (&second_op, second_qargs, "second_qargs"),
+        ] {
+            if qargs.len() != op.num_qubits() as usize {
+                return Err(QiskitError::new_err(format!(
+                    "{name} must contain {} qubits, got {}",
+                    op.num_qubits(),
+                    qargs.len()
+                )));
+            }
+        }
+        let (first_qargs, second_qargs) = get_bits_from_py::<Qubit>(first_qargs, second_qargs)?;
+        // get_relative_placement requires unique arguments for its unchecked map insertion.
+        validate_unique_bits(&first_qargs, "first_qargs")?;
+        validate_unique_bits(&second_qargs, "second_qargs")?;
+        if first_qargs.iter().all(|q| !second_qargs.contains(q)) {
+            // Compressed table entries describe overlapping placements only.
+            return Ok(None);
+        }
+        let (first_op, second_op, first_qargs, second_qargs) =
+            if library_order_key(&first_op) > library_order_key(&second_op) {
+                (&second_op, &first_op, &second_qargs, &first_qargs)
+            } else {
+                (&first_op, &second_op, &first_qargs, &second_qargs)
+            };
+        let placement = get_relative_placement(first_qargs, second_qargs);
+        Ok(self
+            .library
+            .check_commutation_entries(first_op, second_op, &placement))
+    }
+
     #[pyo3(signature=(op1, op2, max_num_qubits=None, approximation_degree=1., matrix_max_num_qubits=3))]
     fn commute_nodes(
         &self,
@@ -561,8 +603,7 @@ impl CommutationChecker {
         }
 
         // Sort the arguments, such that `op2` always is the larger one.
-        let reversed = (op1.num_qubits(), op1.name().len(), op1.name())
-            > (op2.num_qubits(), op2.name().len(), op2.name());
+        let reversed = library_order_key(op1) > library_order_key(op2);
 
         let (op1, op2, params1, params2, qargs1, qargs2) = if reversed {
             (op2, op1, params2, params1, qargs2, qargs1)
@@ -889,6 +930,12 @@ fn map_rotation<'a>(
         };
     }
     (None, params, false)
+}
+
+/// The order of two operations in a commutation library key: fewer qubits first, then the
+/// shorter name in UTF-8 bytes, then the name.
+fn library_order_key<'a>(op: &'a OperationRef<'_>) -> (u32, usize, &'a str) {
+    (op.num_qubits(), op.name().len(), op.name())
 }
 
 fn get_relative_placement(
