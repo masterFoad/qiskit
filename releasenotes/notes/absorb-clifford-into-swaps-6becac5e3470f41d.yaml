@@ -1,0 +1,9 @@
+---
+features_transpiler:
+  - |
+    At ``optimization_level`` 2 and 3, the translation stage now first rewrites a ``swap`` and the
+    nearest two-qubit gate on the same pair of qubits when the gates in between allow it, so that
+    the pair needs two fewer ``cx`` gates (for example, a ``swap`` and a ``cx`` become two ``cx``
+    gates, and two ``swap`` gates become four ``cx`` gates). Every rewrite is exact and is made
+    only if the target supports the result. The pass is not used on targets with a native
+    ``swap``, nor when options for the unitary or high-level synthesis plugins are given.

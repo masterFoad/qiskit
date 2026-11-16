@@ -51,6 +51,7 @@ from qiskit.transpiler.passes import VF2PostLayout
 from qiskit.transpiler.passes.layout.vf2_layout import VF2LayoutStopReason
 from qiskit.transpiler.passes.layout.vf2_post_layout import VF2PostLayoutStopReason
 from qiskit.transpiler.passes import WrapAngles
+from qiskit.transpiler.preset_passmanagers._swap_absorption import _AbsorbIntoSwaps
 from qiskit.transpiler.exceptions import TranspilerError
 from qiskit.transpiler.layout import Layout
 from qiskit.transpiler.optimization_metric import OptimizationMetric
@@ -592,6 +593,42 @@ def generate_translation_passmanager(
     if target is not None and target.has_angle_bounds():
         unroll.append(WrapAngles(target))
     return PassManager(unroll)
+
+
+def _with_swap_absorption(translation, pass_manager_config, optimization_level):
+    """Add :class:`._AbsorbIntoSwaps` as the first pass of a built-in translation stage.
+
+    The pass is added at optimization levels 2 and 3 only.  It is not added when ``swap`` is a
+    native operation, when there is neither a target nor basis gates, or when synthesis plugin
+    options are given, because the pass checks its rewrites by running the passes of
+    ``translation`` on them.  The pass applies its rewrites only if ``translation`` turns all the
+    new gates into supported instructions.  On targets with ``rzz`` it does not move diagonal
+    gates.
+    """
+    target = pass_manager_config.target
+    basis_gates = pass_manager_config.basis_gates
+    operation_names = target.operation_names if target is not None else basis_gates
+    default_synthesis = (
+        pass_manager_config.unitary_synthesis_method == "default"
+        and pass_manager_config.unitary_synthesis_plugin_config is None
+        and pass_manager_config.hls_config is None
+    )
+    if (
+        optimization_level not in (2, 3)
+        or not operation_names
+        or "swap" in operation_names
+        or not default_synthesis
+    ):
+        return translation
+    unroll = list(translation.to_flow_controller().tasks)
+    absorb = _AbsorbIntoSwaps(
+        move_diagonal="rzz" not in operation_names,
+        target=target,
+        basis_gates=basis_gates,
+        check=unroll,
+        peephole_in_loop=optimization_level == 3,
+    )
+    return PassManager([absorb, *unroll])
 
 
 def generate_scheduling(instruction_durations, scheduling_method, timing_constraints, target=None):
