@@ -9,6 +9,7 @@
 // Any modifications or derivative works of this code must retain this
 // copyright notice, and modified files need to carry a notice indicating
 // that they have been altered from the originals.
+// check_commutation_entries fix: Foad Abo Dahood (@masterFoad)
 
 use hashbrown::{HashMap, HashSet};
 use ndarray::Array2;
