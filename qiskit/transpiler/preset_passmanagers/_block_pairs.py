@@ -9,6 +9,7 @@
 # Any modifications or derivative works of this code must retain this
 # copyright notice, and modified files need to carry a notice indicating
 # that they have been altered from the originals.
+# Author: Foad Abo Dahood (@masterFoad)
 
 """Resynthesize pairs of two-qubit blocks on the same qubits across a commuting gap.
 
